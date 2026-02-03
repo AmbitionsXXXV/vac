@@ -1,0 +1,38 @@
+repos:
+  - repo: local
+    hooks:
+      - id: yamllint
+        name: yamllint
+        entry: yamllint -c .yamllint
+        language: system
+        types: [yaml]
+        require_serial: true
+
+      - id: typos
+        name: typos
+        entry: typos
+        language: system
+        types: [text]
+        exclude: '^(target/|Cargo\.lock$)'
+        require_serial: true
+
+      - id: cargo-deny
+        name: cargo-deny
+        entry: cargo deny check licenses bans sources
+        language: system
+        pass_filenames: false
+        require_serial: true
+
+      - id: cargo-clippy
+        name: cargo-clippy
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        pass_filenames: false
+        require_serial: true
+
+      - id: cargo-nextest
+        name: cargo-nextest
+        entry: cargo nextest run --all-features
+        language: system
+        pass_filenames: false
+        require_serial: true
