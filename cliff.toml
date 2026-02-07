@@ -31,6 +31,11 @@ body = """
 - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
 {% if commit.breaking %}[**breaking**] {% endif %}\
 {{ commit.message | upper_first }}\
+{% if commit.body %}
+{% for line in commit.body | trim | split(pat="\n") %}
+  - {{ line | trim_start_matches(pat="- ") | trim | upper_first }}\
+{% endfor %}
+{% endif -%}
 {% endfor %}
 {% endfor %}
 """
