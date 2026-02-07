@@ -109,6 +109,14 @@ vac/
 - **directories**: 系统目录获取
 - **rayon**: 并行计算（目录大小）
 
+## 版本管理与 Changelog
+
+- 使用 [git-cliff](https://git-cliff.org/) 自动从 commit 历史生成 `CHANGELOG.md`
+- 配置文件 `cliff.toml` 定制了 commit message 解析规则，匹配项目 `type: emoji description` 风格
+- commit body 中的逐项说明会自动展开为子列表
+- 生成命令：`git-cliff --tag <version> -o CHANGELOG.md`
+- 追加新版本：`git-cliff --tag <version> --unreleased --prepend CHANGELOG.md`
+
 ## 状态流转
 
 ```text
