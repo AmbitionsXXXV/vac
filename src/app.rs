@@ -17,6 +17,8 @@ pub enum Mode {
     Help,
     /// 路径输入模式
     InputPath,
+    /// 搜索模式
+    Search,
 }
 
 /// 排序方式
@@ -66,6 +68,16 @@ pub enum ItemCategory {
     Downloads,
     /// 垃圾桶
     Trash,
+    /// CocoaPods 缓存
+    CocoaPods,
+    /// npm 缓存
+    NpmCache,
+    /// pip 缓存
+    PipCache,
+    /// Docker 数据
+    DockerData,
+    /// Cargo 缓存
+    CargoCache,
 }
 
 impl ItemCategory {
@@ -78,6 +90,11 @@ impl ItemCategory {
             ItemCategory::XcodeDerivedData => "Xcode 派生数据",
             ItemCategory::NodeModules => "node_modules",
             ItemCategory::HomebrewCache => "Homebrew 缓存",
+            ItemCategory::CocoaPods => "CocoaPods 缓存",
+            ItemCategory::NpmCache => "npm 缓存",
+            ItemCategory::PipCache => "pip 缓存",
+            ItemCategory::DockerData => "Docker 数据",
+            ItemCategory::CargoCache => "Cargo 缓存",
             ItemCategory::Downloads => "下载文件夹",
             ItemCategory::Trash => "垃圾桶",
         }
@@ -92,6 +109,11 @@ impl ItemCategory {
             ItemCategory::XcodeDerivedData => "Xcode 构建产物和索引",
             ItemCategory::NodeModules => "Node.js 依赖目录",
             ItemCategory::HomebrewCache => "Homebrew 下载缓存",
+            ItemCategory::CocoaPods => "CocoaPods 缓存目录",
+            ItemCategory::NpmCache => "npm 包下载缓存",
+            ItemCategory::PipCache => "pip 包下载缓存",
+            ItemCategory::DockerData => "Docker 容器和镜像数据",
+            ItemCategory::CargoCache => "Cargo registry 下载缓存",
             ItemCategory::Downloads => "下载文件夹中的文件",
             ItemCategory::Trash => "回收站中的文件",
         }
@@ -123,7 +145,7 @@ pub struct SelectedEntry {
 }
 
 /// 导航状态
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NavigationState {
     pub current_path: Option<PathBuf>,
     pub path_stack: Vec<PathBuf>,
@@ -196,6 +218,16 @@ pub struct App {
     pub sort_order: SortOrder,
     /// 路径输入缓冲区
     pub input_buffer: String,
+    /// 可视区域高度（由渲染时更新）
+    pub visible_height: usize,
+    /// 上次清理结果：(释放空间, 条目数)
+    pub last_clean_result: Option<(u64, usize)>,
+    /// 确认弹窗滚动偏移
+    pub confirm_scroll: usize,
+    /// 搜索查询字符串
+    pub search_query: String,
+    /// 搜索前的原始条目（用于取消搜索时恢复）
+    pub pre_search_entries: Vec<CleanableEntry>,
 }
 
 impl Default for App {
@@ -227,6 +259,11 @@ impl App {
             scan_in_progress: false,
             sort_order: SortOrder::default(),
             input_buffer: String::new(),
+            visible_height: 20,
+            last_clean_result: None,
+            confirm_scroll: 0,
+            search_query: String::new(),
+            pre_search_entries: Vec::new(),
         }
     }
 
@@ -260,6 +297,42 @@ impl App {
         self.list_state.select(Some(i));
     }
 
+    /// 跳到列表第一项
+    pub fn first(&mut self) {
+        if !self.entries.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    /// 跳到列表最后一项
+    pub fn last(&mut self) {
+        if !self.entries.is_empty() {
+            self.list_state.select(Some(self.entries.len() - 1));
+        }
+    }
+
+    /// 向下翻半页
+    pub fn page_down(&mut self, visible_height: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let half_page = (visible_height / 2).max(1);
+        let current = self.list_state.selected().unwrap_or(0);
+        let target = (current + half_page).min(self.entries.len() - 1);
+        self.list_state.select(Some(target));
+    }
+
+    /// 向上翻半页
+    pub fn page_up(&mut self, visible_height: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let half_page = (visible_height / 2).max(1);
+        let current = self.list_state.selected().unwrap_or(0);
+        let target = current.saturating_sub(half_page);
+        self.list_state.select(Some(target));
+    }
+
     /// 当前高亮条目
     pub fn current_entry(&self) -> Option<&CleanableEntry> {
         let index = self.list_state.selected()?;
@@ -281,31 +354,48 @@ impl App {
             .entries
             .iter()
             .all(|entry| self.selections.contains_key(&entry.path));
-        let entries = self.entries.clone();
-        for entry in &entries {
-            self.set_selected(&entry.path, !all_selected, entry);
+        // 收集路径和元数据，避免 clone 整个 entries
+        let info: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| (e.path.clone(), e.kind, e.size))
+            .collect();
+        for (path, kind, size) in info {
+            if !all_selected {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.selections.entry(path)
+                {
+                    entry.insert(SelectedEntry { kind, size });
+                    if let Some(s) = size {
+                        self.selected_size += s;
+                    }
+                }
+            } else if let Some(prev) = self.selections.remove(&path)
+                && let Some(s) = prev.size
+            {
+                self.selected_size = self.selected_size.saturating_sub(s);
+            }
         }
     }
 
     /// 更新条目选中状态
     fn set_selected(&mut self, path: &PathBuf, selected: bool, entry: &CleanableEntry) {
         if selected {
-            if !self.selections.contains_key(path) {
-                self.selections.insert(
-                    path.clone(),
-                    SelectedEntry {
-                        kind: entry.kind,
-                        size: entry.size,
-                    },
-                );
+            if let std::collections::hash_map::Entry::Vacant(vacant) =
+                self.selections.entry(path.clone())
+            {
+                vacant.insert(SelectedEntry {
+                    kind: entry.kind,
+                    size: entry.size,
+                });
                 if let Some(size) = entry.size {
                     self.selected_size += size;
                 }
             }
-        } else if let Some(prev) = self.selections.remove(path) {
-            if let Some(size) = prev.size {
-                self.selected_size = self.selected_size.saturating_sub(size);
-            }
+        } else if let Some(prev) = self.selections.remove(path)
+            && let Some(size) = prev.size
+        {
+            self.selected_size = self.selected_size.saturating_sub(size);
         }
     }
 
@@ -322,6 +412,12 @@ impl App {
         } else {
             self.list_state.select(Some(0));
         }
+    }
+
+    /// 恢复根目录条目视图
+    pub fn restore_root_entries(&mut self) {
+        let entries = self.root_entries.clone();
+        self.set_entries(entries);
     }
 
     /// 清空当前视图条目
@@ -363,18 +459,18 @@ impl App {
 
     /// 回填条目大小
     pub fn apply_entry_size(&mut self, path: &PathBuf, size: u64) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == *path) {
-            if entry.size.is_none() {
-                entry.size = Some(size);
-                self.total_size += size;
-            }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == *path)
+            && entry.size.is_none()
+        {
+            entry.size = Some(size);
+            self.total_size += size;
         }
 
-        if let Some(selected) = self.selections.get_mut(path) {
-            if selected.size.is_none() {
-                selected.size = Some(size);
-                self.selected_size += size;
-            }
+        if let Some(selected) = self.selections.get_mut(path)
+            && selected.size.is_none()
+        {
+            selected.size = Some(size);
+            self.selected_size += size;
         }
     }
 
@@ -433,6 +529,7 @@ impl App {
     /// 进入确认删除模式
     pub fn enter_confirm_mode(&mut self) {
         if self.selected_size > 0 {
+            self.confirm_scroll = 0;
             self.mode = Mode::Confirm;
         }
     }
@@ -484,6 +581,54 @@ impl App {
     pub fn clear_selections(&mut self) {
         self.selections.clear();
         self.selected_size = 0;
+    }
+
+    /// 进入搜索模式
+    pub fn start_search(&mut self) {
+        self.search_query.clear();
+        self.pre_search_entries = self.entries.clone();
+        self.mode = Mode::Search;
+    }
+
+    /// 搜索输入字符
+    pub fn search_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.apply_search_filter();
+    }
+
+    /// 搜索删除字符
+    pub fn search_backspace(&mut self) {
+        self.search_query.pop();
+        self.apply_search_filter();
+    }
+
+    /// 应用搜索过滤
+    fn apply_search_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.set_entries(self.pre_search_entries.clone());
+            return;
+        }
+        let query = self.search_query.to_lowercase();
+        let filtered: Vec<CleanableEntry> = self
+            .pre_search_entries
+            .iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        self.set_entries(filtered);
+    }
+
+    /// 确认搜索（保留过滤结果）
+    pub fn confirm_search(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// 取消搜索（恢复原始列表）
+    pub fn cancel_search(&mut self) {
+        self.mode = Mode::Normal;
+        let restored = self.pre_search_entries.clone();
+        self.set_entries(restored);
+        self.search_query.clear();
     }
 
     /// 进入路径输入模式

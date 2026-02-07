@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use color_eyre::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use vac::app::{App, EntryKind, Mode};
 use vac::cleaner::Cleaner;
@@ -70,16 +70,24 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
         }
 
-        if event::poll(Duration::from_millis(50))?
+        let poll_timeout = if scan_rx.is_some() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(poll_timeout)?
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
 
-            // 处理错误消息时，任意键关闭
+            // 处理错误消息时，仅 Enter/Esc 关闭
             if app.error_message.is_some() {
-                app.clear_error();
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => app.clear_error(),
+                    _ => {}
+                }
                 continue;
             }
 
@@ -113,6 +121,18 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 continue;
             }
 
+            // 搜索模式
+            if app.mode == Mode::Search {
+                match key.code {
+                    KeyCode::Esc => app.cancel_search(),
+                    KeyCode::Enter => app.confirm_search(),
+                    KeyCode::Backspace => app.search_backspace(),
+                    KeyCode::Char(c) => app.search_char(c),
+                    _ => {}
+                }
+                continue;
+            }
+
             // 根扫描中仅允许取消/退出
             if app.mode == Mode::Scanning {
                 match key.code {
@@ -122,6 +142,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 }
                 continue;
             }
+
+            // 清除上次清理结果通知
+            app.last_clean_result = None;
 
             // 扫描中按 Esc 可取消
             if app.scan_in_progress && key.code == KeyCode::Esc {
@@ -142,26 +165,47 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         scan_rx = start_disk_scan(&mut app, home, &cancel_generation);
                     }
                 }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let h = app.visible_height;
+                    app.page_down(h);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let h = app.visible_height;
+                    app.page_up(h);
+                }
                 KeyCode::Char('d') => {
-                    // 进入路径输入模式
                     app.start_input();
                 }
                 KeyCode::Char('o') => {
-                    // 切换排序方式
                     app.toggle_sort_order();
                 }
                 KeyCode::Down | KeyCode::Char('j') => app.next(),
                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                KeyCode::Char('g') => app.first(),
+                KeyCode::Char('G') => app.last(),
+                KeyCode::PageDown => {
+                    let h = app.visible_height;
+                    app.page_down(h);
+                }
+                KeyCode::PageUp => {
+                    let h = app.visible_height;
+                    app.page_up(h);
+                }
+                KeyCode::Char('/') => app.start_search(),
                 KeyCode::Char(' ') => app.toggle_selected(),
                 KeyCode::Char('a') => app.toggle_all(),
                 KeyCode::Char('c') => app.enter_confirm_mode(),
                 KeyCode::Enter => {
-                    if let Some(entry) = app.current_entry().cloned() {
-                        if entry.kind == EntryKind::Directory {
-                            let target = entry.path.clone();
-                            app.navigation.enter(target.clone());
-                            scan_rx = start_dir_scan(&mut app, target, &cancel_generation);
+                    let target = app.current_entry().and_then(|e| {
+                        if e.kind == EntryKind::Directory {
+                            Some(e.path.clone())
+                        } else {
+                            None
                         }
+                    });
+                    if let Some(target) = target {
+                        app.navigation.enter(target.clone());
+                        scan_rx = start_dir_scan(&mut app, target, &cancel_generation);
                     }
                 }
                 KeyCode::Backspace | KeyCode::Esc => {
@@ -173,7 +217,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         if let Some(path) = app.navigation.current_path.clone() {
                             scan_rx = start_dir_scan(&mut app, path, &cancel_generation);
                         } else {
-                            app.set_entries(app.root_entries.clone());
+                            app.restore_root_entries();
                         }
                     }
                 }
@@ -222,6 +266,14 @@ fn handle_confirm_mode(
         }
         KeyCode::Esc => {
             app.cancel_confirm();
+            None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.confirm_scroll = app.confirm_scroll.saturating_add(1);
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.confirm_scroll = app.confirm_scroll.saturating_sub(1);
             None
         }
         _ => None,
@@ -339,9 +391,11 @@ fn execute_clean(
         }
     }
 
+    let item_count = selected_items.len();
     let result = Cleaner::clean(&selected_items);
 
     if result.success {
+        app.last_clean_result = Some((result.freed_space, item_count));
         app.clear_selections();
 
         if let Some(path) = app.navigation.current_path.clone() {

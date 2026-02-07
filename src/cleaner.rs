@@ -91,9 +91,18 @@ impl Cleaner {
     }
 
     /// 安全检查：确保路径可以安全删除
+    ///
+    /// 使用 canonicalize 解析符号链接，防止通过符号链接绕过安全检查。
+    /// 禁止删除系统关键目录和用户根目录本身。
     pub fn is_safe_to_delete(path: &Path) -> bool {
+        // 规范化路径，解析符号链接
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
         // 不允许删除的路径
-        let forbidden = [
+        const FORBIDDEN: &[&str] = &[
             "/",
             "/System",
             "/Library",
@@ -107,10 +116,10 @@ impl Cleaner {
             "/private",
         ];
 
-        let path_str = path.to_string_lossy();
+        let path_str = canonical.to_string_lossy();
 
         // 检查是否为禁止路径
-        for f in &forbidden {
+        for f in FORBIDDEN {
             if path_str == *f {
                 return false;
             }
@@ -119,13 +128,20 @@ impl Cleaner {
         // 确保路径在用户目录下或临时目录下
         if let Some(home) = directories::UserDirs::new() {
             let home_path = home.home_dir();
-            if path.starts_with(home_path) {
+            // 不允许删除用户根目录本身
+            if canonical == home_path {
+                return false;
+            }
+            if canonical.starts_with(home_path) {
                 return true;
             }
         }
 
-        // 允许临时目录
-        if path.starts_with("/tmp") || path.starts_with("/var/tmp") {
+        // 允许临时目录（含 macOS /private/tmp 实际路径）
+        if canonical.starts_with("/tmp")
+            || canonical.starts_with("/private/tmp")
+            || canonical.starts_with("/var/tmp")
+        {
             return true;
         }
 
@@ -175,6 +191,20 @@ mod tests {
         for path in forbidden {
             assert!(!Cleaner::is_safe_to_delete(Path::new(path)));
         }
+    }
+
+    #[test]
+    fn is_safe_to_delete_rejects_user_home_directory() {
+        if let Some(home) = directories::UserDirs::new() {
+            assert!(!Cleaner::is_safe_to_delete(home.home_dir()));
+        }
+    }
+
+    #[test]
+    fn is_safe_to_delete_rejects_nonexistent_paths() {
+        assert!(!Cleaner::is_safe_to_delete(Path::new(
+            "/tmp/vac-nonexistent-path-12345"
+        )));
     }
 
     #[test]

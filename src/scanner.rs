@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::app::{CleanableEntry, EntryKind, ItemCategory};
@@ -33,7 +34,11 @@ pub enum ScanMessage {
     /// 目录条目
     DirEntry { job_id: u64, entry: CleanableEntry },
     /// 目录大小回填
-    DirEntrySize { job_id: u64, path: PathBuf, size: u64 },
+    DirEntrySize {
+        job_id: u64,
+        path: PathBuf,
+        size: u64,
+    },
     /// 全部扫描完成
     Done { job_id: u64 },
     /// 扫描出错
@@ -96,6 +101,38 @@ impl Scanner {
             targets.push((ItemCategory::HomebrewCache, brew_cache));
         }
 
+        // CocoaPods 缓存
+        let cocoapods_cache = self.home_dir.join("Library/Caches/CocoaPods");
+        if cocoapods_cache.exists() {
+            targets.push((ItemCategory::CocoaPods, cocoapods_cache));
+        }
+
+        // npm 缓存
+        let npm_cache = self.home_dir.join(".npm/_cacache");
+        if npm_cache.exists() {
+            targets.push((ItemCategory::NpmCache, npm_cache));
+        }
+
+        // pip 缓存
+        let pip_cache = self.home_dir.join("Library/Caches/pip");
+        if pip_cache.exists() {
+            targets.push((ItemCategory::PipCache, pip_cache));
+        }
+
+        // Docker 数据
+        let docker_data = self
+            .home_dir
+            .join("Library/Containers/com.docker.docker/Data");
+        if docker_data.exists() {
+            targets.push((ItemCategory::DockerData, docker_data));
+        }
+
+        // Cargo 缓存
+        let cargo_cache = self.home_dir.join(".cargo/registry/cache");
+        if cargo_cache.exists() {
+            targets.push((ItemCategory::CargoCache, cargo_cache));
+        }
+
         targets
     }
 
@@ -106,6 +143,7 @@ impl Scanner {
         }
 
         WalkDir::new(path)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
@@ -120,28 +158,7 @@ impl Scanner {
         job_id: u64,
         cancel_gen: &AtomicU64,
     ) -> u64 {
-        if !path.exists() {
-            return 0;
-        }
-
-        let mut total = 0u64;
-        for entry in WalkDir::new(path).into_iter() {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
-                return total;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if let Ok(metadata) = entry.metadata() {
-                total += metadata.len();
-            }
-        }
-
-        total
+        calc_dir_size(path, job_id, cancel_gen)
     }
 
     /// 带进度回调的根目录扫描
@@ -229,10 +246,7 @@ impl Scanner {
             };
 
             let entry_path = entry.path();
-            let name = entry
-                .file_name()
-                .to_string_lossy()
-                .to_string();
+            let name = entry.file_name().to_string_lossy().to_string();
 
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
@@ -262,22 +276,21 @@ impl Scanner {
             }
         }
 
-        for dir_path in dir_paths {
+        // 并行计算目录大小
+        dir_paths.par_iter().for_each(|dir_path| {
             if cancel_gen.load(Ordering::Relaxed) != job_id {
                 return;
             }
-
-            let size = self.scan_directory_with_cancel(&dir_path, job_id, &cancel_gen);
+            let size = calc_dir_size(dir_path, job_id, &cancel_gen);
             if cancel_gen.load(Ordering::Relaxed) != job_id {
                 return;
             }
-
             let _ = tx.send(ScanMessage::DirEntrySize {
                 job_id,
-                path: dir_path,
+                path: dir_path.clone(),
                 size,
             });
-        }
+        });
 
         let _ = tx.send(ScanMessage::Done { job_id });
     }
@@ -375,31 +388,26 @@ impl Scanner {
             }
         }
 
-        // 计算目录大小
-        let dir_total = dir_paths.len().max(1);
-        for (index, dir_path) in dir_paths.into_iter().enumerate() {
+        // 并行计算目录大小
+        let _ = tx.send(ScanMessage::Progress {
+            job_id,
+            progress: 50,
+            path: "并行计算目录大小...".to_string(),
+        });
+        dir_paths.par_iter().for_each(|dir_path| {
             if cancel_gen.load(Ordering::Relaxed) != job_id {
                 return;
             }
-
-            let progress = 50 + ((index as f32 / dir_total as f32) * 50.0) as u8;
-            let _ = tx.send(ScanMessage::Progress {
-                job_id,
-                progress,
-                path: format!("计算大小: {}", dir_path.display()),
-            });
-
-            let size = self.scan_directory_with_cancel(&dir_path, job_id, &cancel_gen);
+            let size = calc_dir_size(dir_path, job_id, &cancel_gen);
             if cancel_gen.load(Ordering::Relaxed) != job_id {
                 return;
             }
-
             let _ = tx.send(ScanMessage::DirEntrySize {
                 job_id,
-                path: dir_path,
+                path: dir_path.clone(),
                 size,
             });
-        }
+        });
 
         let _ = tx.send(ScanMessage::Done { job_id });
     }
@@ -414,6 +422,32 @@ impl Default for Scanner {
     fn default() -> Self {
         Self::new().expect("无法获取用户目录")
     }
+}
+
+/// 计算目录大小（可取消），独立函数以支持 rayon 并行调用
+fn calc_dir_size(path: &PathBuf, job_id: u64, cancel_gen: &AtomicU64) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+
+    let mut total = 0u64;
+    for entry in WalkDir::new(path).follow_links(false).into_iter() {
+        if cancel_gen.load(Ordering::Relaxed) != job_id {
+            return total;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata() {
+            total += metadata.len();
+        }
+    }
+
+    total
 }
 
 /// 格式化字节大小为人类可读格式
