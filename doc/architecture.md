@@ -34,13 +34,30 @@ vac/
 - `ItemCategory`: 扫描项分类（系统缓存、日志、临时文件、下载、垃圾桶、Xcode、Homebrew、CocoaPods、npm、pip、Docker、Cargo 等）
 - `CleanableEntry`: 当前视图条目
 - `SelectedEntry`: 已选条目元数据
-- `NavigationState`: 导航状态（当前路径、路径栈）
+- `NavigationState`: 导航状态（当前路径、带缓存的导航栈）
+- `NavFrame`: 导航栈帧，保存路径、条目快照和滚动位置
 
 导航方法：
 
 - `next()` / `previous()`: 单步移动
 - `first()` / `last()`: 跳到首/末项
 - `page_down()` / `page_up()`: 翻半页（接受可视高度参数）
+
+目录导航缓存：
+
+- `enter()`: 进入子目录时，将当前条目列表和滚动位置保存到导航栈帧中
+- `back()`: 回退时直接从栈帧恢复缓存的条目和滚动位置，无需重新扫描磁盘
+- 回退恢复缓存后会重新按当前 `sort_order` 排序，保持排序指示与列表顺序一致
+- 回退到根目录时通过 `restore_root_entries()` 从 `root_entries` 缓存恢复
+
+排序方法：
+
+- `sort_root_entries()`: 根层条目排序，根据当前 `sort_order` 排序 `root_entries`
+- `sort_dir_entries()`: 目录条目排序，根据当前 `sort_order` 排序 `entries`
+- `toggle_sort_order()`: 切换排序方式，自动区分根目录和子目录场景
+- `restore_root_entries()`: 恢复根目录视图时重新应用当前排序
+
+排序方式在整个 session 中保持一致：用户通过 `o` 键设置的排序方式会在进入子目录、返回上级目录、返回根目录时持续生效，无需重复切换。
 
 搜索方法：
 

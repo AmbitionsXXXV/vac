@@ -2,6 +2,22 @@
 
 All notable changes to VAC will be documented in this file.
 
+## [unreleased]
+
+### ✨ Features
+
+- Make directory navigation more responsive by restoring the previous listing when going back.
+
+- Keep sort order consistent across the root view and subdirectories.
+
+### 🧪 Testing
+
+- Add `cargo-nextest` configuration and document the recommended test workflow.
+
+### 📚 Documentation
+
+- Document navigation caching and persistent sorting behavior in the architecture guide.
+
 ## [0.2.0] - 2026-02-07
 
 ### ✨ Features

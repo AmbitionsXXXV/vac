@@ -1,0 +1,28 @@
+# cargo-nextest configuration
+# Docs: https://nexte.st/docs/configuration/
+
+[profile.default]
+# Default test threads (0 = auto-detect based on CPU cores)
+# test-threads = 0
+
+# Slow test threshold: warn if a test takes longer than this
+slow-timeout = { period = "60s" }
+
+# Retry failed tests
+retries = 0
+
+# Status level for test output
+status-level = "pass"
+
+# Fail on first test failure
+fail-fast = true
+
+[profile.ci]
+# CI profile: do not cancel the test run on the first failure
+fail-fast = false
+
+# In CI, retry flaky tests once
+retries = 1
+
+# Longer slow-test timeout for CI environments
+slow-timeout = { period = "120s", terminate-after = 2 }

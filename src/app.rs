@@ -144,34 +144,56 @@ pub struct SelectedEntry {
     pub size: Option<u64>,
 }
 
+/// 导航栈帧：保存一层目录的路径、条目和滚动位置
+#[derive(Debug, Clone)]
+struct NavFrame {
+    path: PathBuf,
+    entries: Vec<CleanableEntry>,
+    selected_index: Option<usize>,
+}
+
 /// 导航状态
 #[derive(Debug, Clone, Default)]
 pub struct NavigationState {
     pub current_path: Option<PathBuf>,
-    pub path_stack: Vec<PathBuf>,
+    stack: Vec<NavFrame>,
 }
 
 impl NavigationState {
     pub fn new() -> Self {
         Self {
             current_path: None,
-            path_stack: Vec::new(),
+            stack: Vec::new(),
         }
     }
 
     pub fn reset_root(&mut self) {
-        self.path_stack.clear();
+        self.stack.clear();
         self.current_path = None;
     }
 
-    pub fn enter(&mut self, path: PathBuf) {
-        self.path_stack.push(path.clone());
+    pub fn enter(
+        &mut self,
+        path: PathBuf,
+        current_entries: Vec<CleanableEntry>,
+        selected_index: Option<usize>,
+    ) {
+        self.stack.push(NavFrame {
+            path: path.clone(),
+            entries: current_entries,
+            selected_index,
+        });
         self.current_path = Some(path);
     }
 
-    pub fn back(&mut self) {
-        self.path_stack.pop();
-        self.current_path = self.path_stack.last().cloned();
+    pub fn back(&mut self) -> Option<(Vec<CleanableEntry>, Option<usize>)> {
+        let popped = self.stack.pop()?;
+        self.current_path = self.stack.last().map(|f| f.path.clone());
+        if self.current_path.is_some() {
+            Some((popped.entries, popped.selected_index))
+        } else {
+            None
+        }
     }
 
     pub fn breadcrumb(&self) -> String {
@@ -416,8 +438,31 @@ impl App {
 
     /// 恢复根目录条目视图
     pub fn restore_root_entries(&mut self) {
-        let entries = self.root_entries.clone();
-        self.set_entries(entries);
+        self.sort_root_entries();
+    }
+
+    /// 从缓存恢复目录条目视图（回退到上一级目录时使用）
+    pub fn restore_cached_dir_entries(
+        &mut self,
+        cached_entries: Vec<CleanableEntry>,
+        selected_index: Option<usize>,
+    ) {
+        let selected_path = selected_index
+            .and_then(|index| cached_entries.get(index))
+            .map(|entry| entry.path.clone());
+
+        self.set_entries(cached_entries);
+        self.sort_dir_entries();
+
+        if let Some(selected_path) = selected_path {
+            if let Some(restored_index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.path == selected_path)
+            {
+                self.list_state.select(Some(restored_index));
+            }
+        }
     }
 
     /// 清空当前视图条目
@@ -476,8 +521,19 @@ impl App {
 
     /// 根层条目排序
     pub fn sort_root_entries(&mut self) {
-        self.root_entries
-            .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
+        match self.sort_order {
+            SortOrder::ByName => {
+                self.root_entries.sort_by(|a, b| match (a.kind, b.kind) {
+                    (EntryKind::Directory, EntryKind::File) => std::cmp::Ordering::Less,
+                    (EntryKind::File, EntryKind::Directory) => std::cmp::Ordering::Greater,
+                    _ => a.name.cmp(&b.name),
+                });
+            }
+            SortOrder::BySize => {
+                self.root_entries
+                    .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
+            }
+        }
         if self.navigation.current_path.is_none() {
             self.set_entries(self.root_entries.clone());
         }
@@ -506,7 +562,11 @@ impl App {
     /// 切换排序方式
     pub fn toggle_sort_order(&mut self) {
         self.sort_order = self.sort_order.toggle();
-        self.sort_dir_entries();
+        if self.navigation.current_path.is_none() {
+            self.sort_root_entries();
+        } else {
+            self.sort_dir_entries();
+        }
     }
 
     /// 获取选中的项目
@@ -690,6 +750,16 @@ mod tests {
         }
     }
 
+    fn named_entry(name: &str, kind: EntryKind, size: Option<u64>) -> CleanableEntry {
+        CleanableEntry {
+            kind,
+            category: None,
+            path: PathBuf::from(format!("/tmp/{name}")),
+            name: name.to_string(),
+            size,
+        }
+    }
+
     #[test]
     fn toggle_selected_updates_selected_size() {
         let mut app = App::new();
@@ -727,5 +797,202 @@ mod tests {
 
         app.apply_entry_size(&PathBuf::from("/tmp/a"), 12);
         assert_eq!(app.selected_size, 12);
+    }
+
+    #[test]
+    fn sort_root_entries_respects_sort_order_by_size() {
+        let mut app = App::new();
+        app.root_entries = vec![
+            named_entry("small", EntryKind::File, Some(10)),
+            named_entry("big", EntryKind::File, Some(100)),
+            named_entry("mid", EntryKind::File, Some(50)),
+        ];
+        app.sort_order = SortOrder::BySize;
+        app.sort_root_entries();
+
+        let names: Vec<&str> = app.root_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["big", "mid", "small"]);
+    }
+
+    #[test]
+    fn sort_root_entries_respects_sort_order_by_name() {
+        let mut app = App::new();
+        app.root_entries = vec![
+            named_entry("c_file", EntryKind::File, Some(10)),
+            named_entry("a_dir", EntryKind::Directory, Some(100)),
+            named_entry("b_file", EntryKind::File, Some(50)),
+        ];
+        app.sort_order = SortOrder::ByName;
+        app.sort_root_entries();
+
+        let names: Vec<&str> = app.root_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_dir", "b_file", "c_file"]);
+    }
+
+    #[test]
+    fn toggle_sort_order_at_root_applies_to_root_entries() {
+        let mut app = App::new();
+        app.root_entries = vec![
+            named_entry("z_small", EntryKind::File, Some(1)),
+            named_entry("a_big", EntryKind::File, Some(100)),
+        ];
+        // 初始在根目录（navigation.current_path 为 None）
+        assert!(app.navigation.current_path.is_none());
+        app.sort_order = SortOrder::ByName;
+        app.sort_root_entries();
+
+        // 切换到 BySize
+        app.toggle_sort_order();
+        assert_eq!(app.sort_order, SortOrder::BySize);
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_big", "z_small"]);
+    }
+
+    #[test]
+    fn toggle_sort_order_in_subdir_applies_to_dir_entries() {
+        let mut app = App::new();
+        app.navigation
+            .enter(PathBuf::from("/tmp/subdir"), Vec::new(), None);
+        app.entries = vec![
+            named_entry("z_item", EntryKind::File, Some(1)),
+            named_entry("a_item", EntryKind::File, Some(100)),
+        ];
+        app.sort_order = SortOrder::BySize;
+
+        // 切换到 ByName
+        app.toggle_sort_order();
+        assert_eq!(app.sort_order, SortOrder::ByName);
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_item", "z_item"]);
+    }
+
+    #[test]
+    fn restore_root_entries_applies_current_sort_order() {
+        let mut app = App::new();
+        app.root_entries = vec![
+            named_entry("z_item", EntryKind::File, Some(1)),
+            named_entry("a_item", EntryKind::File, Some(100)),
+        ];
+        app.sort_order = SortOrder::ByName;
+
+        app.restore_root_entries();
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_item", "z_item"]);
+    }
+
+    #[test]
+    fn restore_cached_dir_entries_applies_current_sort_order_and_preserves_selection() {
+        let mut app = App::new();
+        app.sort_order = SortOrder::BySize;
+        app.navigation
+            .enter(PathBuf::from("/tmp/parent"), Vec::new(), None);
+
+        let cached_entries = vec![
+            named_entry("z_small", EntryKind::File, Some(1)),
+            named_entry("a_big", EntryKind::File, Some(100)),
+        ];
+        // 之前在缓存顺序中选中 z_small（索引 0），切换到 BySize 后应仍选中该条目
+        app.restore_cached_dir_entries(cached_entries, Some(0));
+
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_big", "z_small"]);
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn back_returns_cached_entries_and_selected_index() {
+        let mut nav = NavigationState::new();
+        let root_entries = vec![
+            named_entry("dir_a", EntryKind::Directory, Some(100)),
+            named_entry("dir_b", EntryKind::Directory, Some(50)),
+        ];
+
+        // 进入 dir_a，缓存根层条目和选中位置
+        nav.enter(PathBuf::from("/tmp/dir_a"), root_entries.clone(), Some(0));
+        assert_eq!(nav.current_path, Some(PathBuf::from("/tmp/dir_a")));
+
+        // 回退：应恢复缓存的条目和选中位置
+        let result = nav.back();
+        assert!(result.is_none()); // 回到根目录，栈为空
+        assert!(nav.current_path.is_none());
+    }
+
+    #[test]
+    fn back_from_nested_restores_parent_cache() {
+        let mut nav = NavigationState::new();
+        let level1_entries = vec![
+            named_entry("child_a", EntryKind::Directory, Some(30)),
+            named_entry("child_b", EntryKind::File, Some(20)),
+        ];
+
+        // 进入第一层（从根进入，缓存空的根条目）
+        nav.enter(PathBuf::from("/tmp/dir"), Vec::new(), Some(0));
+        // 进入第二层，缓存第一层条目
+        nav.enter(
+            PathBuf::from("/tmp/dir/sub"),
+            level1_entries.clone(),
+            Some(1),
+        );
+        assert_eq!(nav.current_path, Some(PathBuf::from("/tmp/dir/sub")));
+
+        // 从第二层回退，应恢复进入第二层时缓存的条目（level1_entries）
+        let result = nav.back();
+        assert!(result.is_some());
+        let (cached, idx) = result.unwrap();
+        assert_eq!(nav.current_path, Some(PathBuf::from("/tmp/dir")));
+        assert_eq!(cached.len(), 2); // 进入第二层时缓存的 level1_entries
+        assert_eq!(idx, Some(1));
+
+        // 再回退到根目录
+        let result = nav.back();
+        assert!(result.is_none());
+        assert!(nav.current_path.is_none());
+    }
+
+    #[test]
+    fn back_restores_entries_in_app() {
+        let mut app = App::new();
+        let root_entries = vec![named_entry("dir_parent", EntryKind::Directory, Some(200))];
+        app.set_entries(root_entries.clone());
+
+        // 进入第一层子目录，缓存根条目
+        let parent_entries = vec![
+            named_entry("file_a", EntryKind::File, Some(100)),
+            named_entry("file_b", EntryKind::File, Some(50)),
+        ];
+        app.navigation
+            .enter(PathBuf::from("/tmp/parent"), app.entries.clone(), Some(0));
+        app.set_entries(parent_entries.clone());
+
+        // 进入第二层子目录，缓存第一层条目
+        app.navigation.enter(
+            PathBuf::from("/tmp/parent/child"),
+            app.entries.clone(),
+            Some(1),
+        );
+        app.set_entries(vec![named_entry("sub_file", EntryKind::File, Some(10))]);
+        assert_eq!(app.entries.len(), 1);
+
+        // 从第二层回退到第一层：恢复缓存
+        if let Some((cached_entries, selected_index)) = app.navigation.back() {
+            app.set_entries(cached_entries);
+            app.list_state.select(selected_index);
+        }
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.list_state.selected(), Some(1));
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["file_a", "file_b"]);
+    }
+
+    #[test]
+    fn reset_root_clears_navigation_stack() {
+        let mut nav = NavigationState::new();
+        nav.enter(PathBuf::from("/tmp/a"), Vec::new(), None);
+        nav.enter(PathBuf::from("/tmp/a/b"), Vec::new(), None);
+        assert!(nav.current_path.is_some());
+
+        nav.reset_root();
+        assert!(nav.current_path.is_none());
+        assert!(nav.back().is_none());
     }
 }
