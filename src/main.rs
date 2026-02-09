@@ -9,7 +9,8 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use vac::app::{App, EntryKind, Mode};
 use vac::cleaner::Cleaner;
-use vac::scanner::{ScanKind, ScanMessage, Scanner};
+use vac::config::AppConfig;
+use vac::scanner::{ScanKind, ScanMessage, Scanner, scanner_from_config};
 use vac::ui;
 
 fn main() -> Result<()> {
@@ -23,7 +24,8 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    let mut app = App::new();
+    let config = AppConfig::load();
+    let mut app = App::with_config(&config);
     let mut scan_rx: Option<Receiver<ScanMessage>> = None;
     let cancel_generation = Arc::new(AtomicU64::new(0));
 
@@ -97,9 +99,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 continue;
             }
 
+            // 统计面板任意键关闭
+            if app.mode == Mode::Stats {
+                app.toggle_stats();
+                continue;
+            }
+
             // 确认删除界面
             if app.mode == Mode::Confirm {
-                if let Some(rx) = handle_confirm_mode(&mut app, key.code, &cancel_generation) {
+                if let Some(rx) =
+                    handle_confirm_mode(&mut app, key.code, &cancel_generation, &config)
+                {
                     scan_rx = Some(rx);
                 }
                 continue;
@@ -156,11 +166,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 KeyCode::Char('q') => app.quit(),
                 KeyCode::Char('?') => app.toggle_help(),
                 KeyCode::Char('s') => {
-                    scan_rx = start_root_scan(&mut app, &cancel_generation);
+                    scan_rx = start_root_scan(&mut app, &cancel_generation, &config);
                 }
                 KeyCode::Char('S') => {
                     // Shift+S: 扫描主目录
-                    if let Some(scanner) = Scanner::new() {
+                    if let Some(scanner) = scanner_from_config(&config) {
                         let home = scanner.home_dir().clone();
                         scan_rx = start_disk_scan(&mut app, home, &cancel_generation);
                     }
@@ -192,6 +202,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     app.page_up(h);
                 }
                 KeyCode::Char('/') => app.start_search(),
+                KeyCode::Char('t') => app.toggle_stats(),
                 KeyCode::Char(' ') => app.toggle_selected(),
                 KeyCode::Char('a') => app.toggle_all(),
                 KeyCode::Char('c') => app.enter_confirm_mode(),
@@ -258,15 +269,26 @@ fn handle_confirm_mode(
     app: &mut App,
     key: KeyCode,
     cancel_generation: &Arc<AtomicU64>,
+    config: &AppConfig,
 ) -> Option<Receiver<ScanMessage>> {
     match key {
         KeyCode::Enter => {
-            let rx = execute_clean(app, cancel_generation);
+            let rx = execute_clean(app, cancel_generation, config);
             app.mode = Mode::Normal;
             rx
         }
         KeyCode::Esc => {
             app.cancel_confirm();
+            None
+        }
+        KeyCode::Char('d') => {
+            if app.dry_run_active {
+                app.dry_run_active = false;
+            } else {
+                let selected_items = app.get_selected_items();
+                app.dry_run_result = Some(Cleaner::dry_run(&selected_items));
+                app.dry_run_active = true;
+            }
             None
         }
         KeyCode::Char('j') | KeyCode::Down => {
@@ -284,6 +306,7 @@ fn handle_confirm_mode(
 fn start_root_scan(
     app: &mut App,
     cancel_generation: &Arc<AtomicU64>,
+    config: &AppConfig,
 ) -> Option<Receiver<ScanMessage>> {
     let job_id = bump_generation(app, cancel_generation);
     app.scan_kind = ScanKind::Root;
@@ -297,9 +320,10 @@ fn start_root_scan(
 
     let (tx, rx) = mpsc::channel();
     let cancel_clone = cancel_generation.clone();
+    let extra_targets = config.expanded_extra_targets();
 
     thread::spawn(move || {
-        if let Some(scanner) = Scanner::new() {
+        if let Some(scanner) = Scanner::with_extra_targets(extra_targets) {
             scanner.scan_root_with_progress(job_id, tx, cancel_clone);
         } else {
             let _ = tx.send(ScanMessage::Error {
@@ -377,6 +401,7 @@ fn start_disk_scan(
 fn execute_clean(
     app: &mut App,
     cancel_generation: &Arc<AtomicU64>,
+    config: &AppConfig,
 ) -> Option<Receiver<ScanMessage>> {
     let selected_items = app.get_selected_items();
 
@@ -402,7 +427,7 @@ fn execute_clean(
         if let Some(path) = app.navigation.current_path.clone() {
             start_dir_scan(app, path, cancel_generation)
         } else {
-            start_root_scan(app, cancel_generation)
+            start_root_scan(app, cancel_generation, config)
         }
     } else {
         let error_msg = result.errors.join("\n");
