@@ -2,6 +2,52 @@
 
 All notable changes to VAC will be documented in this file.
 
+## [0.4.0] - 2026-02-09
+
+### ✨ Features
+
+- Add CLI non-interactive mode with `--scan`, `--dry-run`, `--clean`, `--output`, `--sort`, `--trash` flags
+
+- New `cli.rs` module: clap-based CLI argument parsing with `ScanTarget` enum (Preset / Home / Path)
+- Non-interactive scan with synchronous progress, sorting, and terminal or JSON report output
+- Support `--dry-run` for simulated deletion statistics without actual cleanup
+- Support `--clean` to execute cleanup in non-interactive mode
+- Support `--output <FILE>` to export scan results as structured JSON report
+- Support `--trash` flag to override config and use system trash instead of permanent deletion
+
+- Add system trash (recycle bin) support via `trash` crate
+
+- New `SafetyConfig` with `move_to_trash` option in `~/.config/vac/config.toml`
+- `Cleaner::trash_items()` moves files to system native trash (macOS Finder)
+- Directory cleanup preserves directory structure, moves contents to trash
+- Confirm popup displays "移至回收站" hint when trash mode is active
+
+- Add Tab directory completion in path input mode
+
+- `Tab` auto-completes matching subdirectories, `Shift+Tab` cycles backward
+- Highlighted candidate list in input popup (max 5 visible items)
+- Supports `~` prefix with home directory expansion in completions
+- Typing or backspace resets completion state automatically
+
+### 🧪 Testing
+
+- Add CLI argument parsing tests (`cli.rs`): scan target parsing, flag combinations, defaults
+- Add trash operation tests (`cleaner.rs`): file trash, directory contents trash, nonexistent path handling
+- Add safety config tests (`config.rs`): default values, TOML parsing, full config with safety section
+
+### 📦 Dependencies
+
+- Add `clap` 4.5.57 (derive) for CLI argument parsing
+- Add `trash` 5.2.5 for system recycle bin API
+- Add `serde_json` 1.0.149 for JSON report serialization
+
+### 📚 Documentation
+
+- Document CLI non-interactive mode architecture, state flow, and usage examples
+- Document Tab completion behavior and keyboard shortcuts
+- Document trash mode configuration and confirm popup changes
+- Update architecture state flow diagrams for both TUI and CLI modes
+
 ## [0.3.0] - 2026-02-09
 
 ### ✨ Features

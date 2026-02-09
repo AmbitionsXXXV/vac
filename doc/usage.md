@@ -6,8 +6,11 @@
 # 从源码构建
 cargo build --release
 
-# 运行
+# 运行（TUI 交互模式）
 ./target/release/vac
+
+# 运行（CLI 非交互模式）
+./target/release/vac --scan preset
 ```
 
 ## 快捷键
@@ -89,6 +92,18 @@ VAC 会扫描以下 macOS 常见可清理目录：
 
 按 `d` 键进入路径输入模式，可以输入任意目录路径进行扫描。支持使用 `~` 表示用户主目录。
 
+#### Tab 目录补全
+
+在路径输入模式下，按 `Tab` 键可自动补全目录路径：
+
+- 输入部分路径后按 `Tab`，自动列出匹配的子目录并补全第一个候选项
+- 连续按 `Tab` 在多个候选目录之间正向循环切换
+- 按 `Shift+Tab` 反向循环切换候选项
+- 当前选中的候选项会在弹窗中高亮显示（最多显示 5 个候选）
+- 输入新字符或退格会自动重置补全状态
+- 补全结果只包含目录（不包含文件），末尾自动添加 `/`
+- 支持 `~` 前缀，补全结果保留 `~` 显示
+
 ## 搜索/过滤
 
 按 `/` 键进入搜索模式，输入关键词实时过滤当前列表。匹配规则为大小写不敏感的名称包含匹配。
@@ -149,14 +164,91 @@ extra_targets = [
 [ui]
 # 默认排序方式: "name" / "size" / "time"
 default_sort = "size"
+
+[safety]
+# 是否移至系统回收站而非永久删除（默认 false）
+move_to_trash = true
 ```
 
 ### 配置说明
 
 - `scan.extra_targets`：在预设扫描（`s`）时额外扫描的目录列表，支持 `~` 展开为主目录，不存在的路径会自动忽略
 - `ui.default_sort`：启动时的默认排序方式，可选值为 `"name"`、`"size"` 或 `"time"`，默认为 `"name"`
+- `safety.move_to_trash`：设为 `true` 时，清理操作会将文件移至系统回收站而非永久删除，提供一层安全网。默认为 `false`
 
 配置文件不存在时使用默认值，配置解析失败时同样 fallback 到默认值。
+
+## 回收站模式
+
+当配置文件中设置了 `safety.move_to_trash = true`，或使用 CLI 的 `--trash` 参数时，清理操作会将文件移至系统回收站而非永久删除。
+
+- 使用系统原生回收站 API（macOS 的 Finder 回收站）
+- 文件可从回收站中恢复
+- 目录清理时保留目录结构本身，内容移至回收站
+- 确认弹窗中会显示"移至回收站"提示，而非"删除"
+
+## CLI 非交互模式
+
+VAC 支持通过命令行参数以非交互方式运行，适用于 CI/CD 环境、自动化脚本或快速查看扫描结果。
+
+### 基本用法
+
+```bash
+# 扫描预设可清理目录
+vac --scan preset
+
+# 扫描用户主目录
+vac --scan home
+
+# 扫描指定路径
+vac --scan /path/to/directory
+vac --scan ~/Downloads
+```
+
+### 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `--scan <MODE_OR_PATH>` | 执行扫描。可选值: `preset`（预设目录）、`home`（主目录）、或指定路径 |
+| `--dry-run` | 仅模拟删除，显示将要清理的文件统计，不执行实际清理 |
+| `--clean` | 执行清理（清理扫描结果中的所有项目） |
+| `--output <FILE>` | 将结果输出为 JSON 文件 |
+| `--sort <ORDER>` | 排序方式: `name` / `size` / `time`，默认 `size` |
+| `--trash` | 使用回收站而非永久删除（覆盖配置文件设置） |
+
+### 使用示例
+
+```bash
+# 扫描预设目录并输出 JSON 报告
+vac --scan preset --output report.json
+
+# 扫描并模拟删除（查看统计但不实际删除）
+vac --scan preset --dry-run
+
+# 扫描并执行清理，按名称排序
+vac --scan preset --clean --sort name
+
+# 扫描并移至回收站
+vac --scan preset --clean --trash
+
+# 扫描指定路径并输出报告
+vac --scan ~/Library/Caches --output caches.json
+
+# 查看帮助
+vac --help
+```
+
+### JSON 报告格式
+
+使用 `--output` 参数时，报告包含以下字段：
+
+- `scan_target`: 扫描目标
+- `sort_order`: 排序方式
+- `total_items`: 条目总数
+- `total_size` / `total_size_display`: 总大小（字节和格式化）
+- `entries`: 条目列表（路径、名称、类型、大小、修改时间）
+- `dry_run`（可选）: Dry-run 统计（文件数、目录数、总大小）
+- `clean_result`（可选）: 清理结果（是否成功、释放空间、错误信息）
 
 ## 层级浏览
 
@@ -183,8 +275,10 @@ default_sort = "size"
 
 ## 注意事项
 
-- 清理操作**不可逆**，请在清理前仔细确认
+- 默认清理操作（永久删除）**不可逆**，请在清理前仔细确认
+- 建议启用 `safety.move_to_trash = true` 或使用 `--trash` 参数，以便误删时可从回收站恢复
 - 建议先备份重要数据
 - 部分缓存删除后可能影响应用启动速度（会自动重建）
 - Xcode DerivedData 删除后需要重新构建项目
 - Docker 数据清理可能导致容器和镜像丢失
+- CLI 的 `--clean` 参数会直接清理所有扫描到的项目，请务必先用 `--dry-run` 预览

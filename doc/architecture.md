@@ -13,9 +13,10 @@ vac/
 │   ├── architecture.md # 架构文档
 │   └── usage.md        # 使用说明
 └── src/
-    ├── main.rs         # 程序入口、事件循环、键盘处理
+    ├── main.rs         # 程序入口、事件循环、键盘处理、CLI 非交互模式
     ├── lib.rs          # 库入口，模块导出
     ├── app.rs          # 应用状态管理
+    ├── cli.rs          # CLI 参数定义（clap）
     ├── config.rs       # 配置文件加载与解析
     ├── ui.rs           # UI 渲染
     ├── scanner.rs      # 磁盘扫描器
@@ -24,13 +25,30 @@ vac/
 
 ## 模块说明
 
+### cli.rs - CLI 参数定义
+
+使用 `clap` (derive 模式) 定义命令行参数：
+
+- `Cli`: 顶层 CLI 参数结构
+  - `--scan <MODE_OR_PATH>`: 非交互扫描，可选值 `preset`（预设目录）、`home`（主目录）、或指定路径
+  - `--dry-run`: 仅模拟删除，不执行实际清理
+  - `--clean`: 执行清理（清理扫描到的所有项目）
+  - `--output <FILE>`: 将结果输出为 JSON 文件
+  - `--sort <ORDER>`: 排序方式（name / size / time），默认 size
+  - `--trash`: 使用回收站而非永久删除（覆盖配置文件设置）
+- `ScanTarget`: 扫描目标枚举（Preset / Home / Path）
+- `Cli::is_non_interactive()`: 判断是否为非交互模式
+
+无参数启动时进入 TUI 交互界面；传入 `--scan` 参数后进入非交互模式直接输出结果。
+
 ### config.rs - 配置文件管理
 
 从 `~/.config/vac/config.toml` 加载用户配置：
 
-- `AppConfig`: 顶层配置结构，包含 `ScanConfig` 和 `UiConfig`
+- `AppConfig`: 顶层配置结构，包含 `ScanConfig`、`UiConfig` 和 `SafetyConfig`
 - `ScanConfig`: 扫描配置，支持 `extra_targets` 额外扫描目标（支持 `~` 展开）
 - `UiConfig`: UI 配置，支持 `default_sort` 设定默认排序方式
+- `SafetyConfig`: 安全配置，支持 `move_to_trash` 设定是否移至回收站（默认 false）
 - `AppConfig::load()`: 从配置文件加载，文件不存在或解析失败时返回默认值
 - `AppConfig::expanded_extra_targets()`: 展开 `~` 并过滤不存在的路径
 
@@ -40,7 +58,7 @@ vac/
 
 核心数据结构：
 
-- `App`: 应用主状态，包含模式、条目列表、扫描进度、选择状态、搜索状态、dry-run 状态等
+- `App`: 应用主状态，包含模式、条目列表、扫描进度、选择状态、搜索状态、dry-run 状态、Tab 补全状态等
 - `Mode`: 应用运行模式 (Normal, Scanning, Confirm, Help, InputPath, Search, Stats)
 - `SortOrder`: 排序方式 (ByName, BySize, ByTime)
 - `EntryKind`: 条目类型（目录/文件）
@@ -83,6 +101,17 @@ vac/
 - `search_char()` / `search_backspace()`: 实时过滤
 - `confirm_search()` / `cancel_search()`: 确认或恢复
 
+路径输入与 Tab 补全：
+
+- `start_input()` / `cancel_input()`: 进入/退出路径输入模式
+- `input_char()` / `input_backspace()`: 路径输入编辑，编辑时自动重置补全状态
+- `confirm_input()`: 确认输入并返回展开后的路径
+- `input_tab_complete()`: Tab 正向补全/循环，根据当前 `input_buffer` 列出匹配目录
+- `input_tab_complete_prev()`: Shift+Tab 反向循环候选项
+- `reset_tab_completions()`: 清空补全状态（`tab_completions` 和 `tab_completion_index`）
+- `expand_input_tilde()`: 将路径中的 `~` 展开为主目录绝对路径
+- `build_tab_completions()`: 内部方法，读取文件系统构建候选列表，只匹配目录，保留 `~` 前缀显示
+
 统计方法：
 
 - `toggle_stats()`: 切换统计面板显示（仅在有根扫描数据时可用）
@@ -102,7 +131,7 @@ vac/
 - `render_confirm_popup()`: 可滚动预览的确认删除弹窗，支持 Dry-run 视图切换
 - `render_dry_run_view()`: Dry-run 详情视图（文件数/目录数/大小）
 - `render_stats_popup()`: 空间占用统计面板（按分类展示进度条）
-- `render_input_popup()`: 路径输入弹窗
+- `render_input_popup()`: 路径输入弹窗（含 Tab 补全候选列表高亮显示，最多展示 5 个候选项）
 - `render_search_bar()`: 搜索栏
 - `render_error_popup()`: 错误弹窗（仅 Enter/Esc 可关闭）
 - `format_time()`: 将 SystemTime 格式化为 YYYY-MM-DD 字符串
@@ -150,12 +179,23 @@ Dry-run 支持：
 - `DryRunResult`: 包含总计和每项的 `DryRunItem` 详情
 - `count_path_contents()`: 内部方法，使用 WalkDir 遍历并计数
 
-### main.rs - 事件循环
+回收站支持：
 
-- 启动时加载 `AppConfig` 配置文件，传递给 `App` 和 `Scanner`
+- `Cleaner::trash_items(items)`: 将选中项移至系统回收站而非永久删除
+- 对目录：移动目录内容至回收站，保留目录本身
+- 对文件：直接移至回收站
+- 使用 `trash` crate 调用系统原生回收站 API
+
+### main.rs - 事件循环与 CLI 入口
+
+- 启动时使用 `clap` 解析 CLI 参数
+- 若传入 `--scan` 参数，进入非交互模式：同步扫描 → 排序 → 输出结果（终端或 JSON 文件）
+- 非交互模式支持 `--dry-run`（模拟删除）、`--clean`（执行清理）、`--trash`（移至回收站）
+- 无参数启动时加载 `AppConfig` 配置文件，进入 TUI 交互界面
 - 事件轮询间隔根据扫描状态动态调整（扫描中 16ms / 空闲 100ms）
 - 支持 Ctrl+d/u 等组合键通过 `KeyModifiers` 判断
 - 分离了各模式（Normal、Confirm、InputPath、Search、Scanning、Help、Stats）的键盘处理逻辑
+- `execute_clean()` 根据 `config.safety.move_to_trash` 选择 trash 或永久删除
 
 ## 技术栈
 
@@ -167,7 +207,10 @@ Dry-run 支持：
 - **directories**: 系统目录获取
 - **rayon**: 并行计算（目录大小）
 - **serde**: 序列化/反序列化框架
+- **serde_json**: JSON 序列化（CLI 报告输出）
 - **toml**: TOML 配置文件解析
+- **clap**: 命令行参数解析（derive 模式）
+- **trash**: 系统回收站 API（移至回收站功能）
 
 ## 版本管理与 Changelog
 
@@ -179,18 +222,20 @@ Dry-run 支持：
 
 ## 状态流转
 
+### TUI 交互模式
+
 ```text
-[启动] → 加载配置 → Normal (欢迎页)
+[启动] → 解析 CLI 参数 → 无 --scan → 加载配置 → Normal (欢迎页)
          ↓ 's'/'S'
-       Scanning ←───────────┐
-         ↓ 完成              │
-       Normal                │
-         ↓ Enter             │
-       浏览目录               │
-         ↓ 'o'               │
+       Scanning ←───────────────┐
+            ↓ 完成              │
+          Normal                │
+            ↓ Enter             │
+       浏览目录                 │
+         ↓ 'o'                  │
        切换排序 (名称/大小/时间)│
-         ↓ 'd'               │
-       InputPath ────────────┘
+         ↓ 'd'                  │
+       InputPath ───────────────┘
          ↓ Enter (输入路径)
        Scanning
          ↓ 完成
@@ -204,7 +249,7 @@ Dry-run 支持：
          ↕ 'd' (切换 Dry-run 视图)
          ↑ Esc
          ↓ Enter
-       清理并刷新 → 通知释放空间
+       清理 (trash/永久删除) → 通知释放空间
          ↓ 't'
        Stats (统计面板)
          ↓ any key
@@ -213,4 +258,20 @@ Dry-run 支持：
         Help
          ↓ any key
        Normal
+```
+
+### CLI 非交互模式
+
+```text
+[启动] → 解析 CLI 参数 → 有 --scan → 加载配置
+         ↓
+       同步扫描 → 排序
+         ↓
+       [--dry-run?] → 模拟删除统计
+         ↓
+       [--clean?] → 执行清理 (--trash 则移至回收站)
+         ↓
+       [--output?] → 输出 JSON 文件
+         ↓
+       终端输出结果 → 退出
 ```

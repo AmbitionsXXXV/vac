@@ -12,6 +12,9 @@ pub struct AppConfig {
     /// UI 相关配置
     #[serde(default)]
     pub ui: UiConfig,
+    /// 安全相关配置
+    #[serde(default)]
+    pub safety: SafetyConfig,
 }
 
 /// 扫描配置
@@ -28,6 +31,14 @@ pub struct UiConfig {
     /// 默认排序方式: "name" / "size" / "time"
     #[serde(default)]
     pub default_sort: Option<String>,
+}
+
+/// 安全相关配置
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SafetyConfig {
+    /// 是否移至系统回收站而非永久删除（默认 false）
+    #[serde(default)]
+    pub move_to_trash: bool,
 }
 
 impl AppConfig {
@@ -136,9 +147,54 @@ default_sort = "time"
                 ],
             },
             ui: UiConfig::default(),
+            safety: SafetyConfig::default(),
         };
         let expanded = config.expanded_extra_targets();
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0], PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn default_safety_config_has_move_to_trash_false() {
+        let config = SafetyConfig::default();
+        assert!(!config.move_to_trash);
+    }
+
+    #[test]
+    fn parse_safety_config_move_to_trash() {
+        let toml_str = r#"
+[safety]
+move_to_trash = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse toml");
+        assert!(config.safety.move_to_trash);
+    }
+
+    #[test]
+    fn parse_full_config_with_safety() {
+        let toml_str = r#"
+[scan]
+extra_targets = ["/tmp"]
+
+[ui]
+default_sort = "size"
+
+[safety]
+move_to_trash = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse toml");
+        assert_eq!(config.scan.extra_targets.len(), 1);
+        assert_eq!(config.ui.default_sort.as_deref(), Some("size"));
+        assert!(config.safety.move_to_trash);
+    }
+
+    #[test]
+    fn parse_toml_without_safety_uses_default() {
+        let toml_str = r#"
+[scan]
+extra_targets = []
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse toml");
+        assert!(!config.safety.move_to_trash);
     }
 }

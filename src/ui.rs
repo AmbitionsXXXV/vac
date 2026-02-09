@@ -308,10 +308,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             }
         }
         Mode::Scanning => "扫描中，请稍候... | Esc: 取消".to_string(),
-        Mode::Confirm => "Enter: 确认删除 | d: 详情预览 | Esc: 取消".to_string(),
+        Mode::Confirm => {
+            if app.use_trash {
+                "Enter: 确认移至回收站 | d: 详情预览 | Esc: 取消".to_string()
+            } else {
+                "Enter: 确认删除 | d: 详情预览 | Esc: 取消".to_string()
+            }
+        }
         Mode::Help => "按任意键关闭帮助".to_string(),
         Mode::Stats => "按任意键关闭统计".to_string(),
-        Mode::InputPath => "输入路径后按 Enter 确认 | Esc: 取消".to_string(),
+        Mode::InputPath => "输入路径后按 Enter 确认 | Tab: 补全 | Esc: 取消".to_string(),
         Mode::Search => "Enter: 确认搜索 | Esc: 取消搜索".to_string(),
     };
 
@@ -457,7 +463,21 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
 
 /// 渲染路径输入弹窗
 fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
-    let area = centered_rect(60, 25, frame.area());
+    // 动态计算弹窗高度：基础行数 + 候选列表行数
+    let max_visible_completions = 5;
+    let completion_count = app.tab_completions.len().min(max_visible_completions);
+    let has_completions = !app.tab_completions.is_empty();
+    // 基础: 标题(1) + 空行(1) + 提示(1) + 空行(1) + 输入行(1) + 空行(1) + 操作提示(1)
+    //       + padding(2) + border(2) = 12 行
+    // 候选列表: 空行(1) + 候选项(N) + 可能的省略提示(1)
+    let extra_lines = if has_completions {
+        1 + completion_count + if app.tab_completions.len() > max_visible_completions { 1 } else { 0 }
+    } else {
+        0
+    };
+    let popup_height = (12 + extra_lines) as u16;
+    let percent_y = ((popup_height as u32) * 100 / frame.area().height as u32).max(20) as u16;
+    let area = centered_rect(60, percent_y.min(80), frame.area());
     frame.render_widget(Clear, area);
 
     let input_display = if app.input_buffer.is_empty() {
@@ -469,7 +489,7 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
         Span::styled(&app.input_buffer, Style::default().fg(theme.text))
     };
 
-    let content = vec![
+    let mut content = vec![
         Line::from(Span::styled(
             "磁盘扫描",
             Style::default().fg(theme.primary).bold(),
@@ -482,14 +502,47 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
             input_display,
             Span::styled("█", Style::default().fg(theme.accent)),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.accent)),
-            Span::raw(" 确认 | "),
-            Span::styled("Esc", Style::default().fg(theme.accent)),
-            Span::raw(" 取消"),
-        ]),
     ];
+
+    // 显示 Tab 补全候选列表
+    if has_completions {
+        content.push(Line::from(""));
+        let current_index = app.tab_completion_index.unwrap_or(0);
+        for (i, completion) in app.tab_completions.iter().enumerate().take(max_visible_completions)
+        {
+            let is_selected = i == current_index;
+            if is_selected {
+                content.push(Line::from(vec![
+                    Span::styled("  ▶ ", Style::default().fg(theme.accent)),
+                    Span::styled(
+                        completion.as_str(),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]));
+            } else {
+                content.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(completion.as_str(), Style::default().fg(theme.text_dim)),
+                ]));
+            }
+        }
+        if app.tab_completions.len() > max_visible_completions {
+            content.push(Line::from(Span::styled(
+                format!("    ... 共 {} 项", app.tab_completions.len()),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+    }
+
+    content.push(Line::from(""));
+    content.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(theme.accent)),
+        Span::raw(" 确认 | "),
+        Span::styled("Tab", Style::default().fg(theme.accent)),
+        Span::raw(" 补全 | "),
+        Span::styled("Esc", Style::default().fg(theme.accent)),
+        Span::raw(" 取消"),
+    ]));
 
     let input_box = Paragraph::new(content)
         .block(
@@ -526,9 +579,14 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     items.sort_by(|a, b| b.1.cmp(&a.1));
 
     // 头部信息行
+    let action_title = if app.use_trash {
+        "⚠ 确认移至回收站"
+    } else {
+        "⚠ 确认删除"
+    };
     let mut lines = vec![
         Line::from(Span::styled(
-            "⚠ 确认删除",
+            action_title,
             Style::default().fg(theme.warning).bold(),
         )),
         Line::from(""),
@@ -570,9 +628,19 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     }
 
     lines.push(Line::from(""));
+    let warning_text = if app.use_trash {
+        "文件将移至系统回收站，可从回收站恢复"
+    } else {
+        "此操作不可逆！"
+    };
+    let warning_color = if app.use_trash {
+        theme.warning
+    } else {
+        theme.danger
+    };
     lines.push(Line::from(Span::styled(
-        "此操作不可逆！",
-        Style::default().fg(theme.danger),
+        warning_text,
+        Style::default().fg(warning_color),
     )));
     lines.push(Line::from(vec![
         Span::styled("Enter", Style::default().fg(theme.accent)),
@@ -757,7 +825,10 @@ fn render_stats_popup(frame: &mut Frame, app: &App, theme: &Theme) {
             Span::raw("  "),
             Span::styled(bar, Style::default().fg(theme.accent)),
             Span::raw("  "),
-            Span::styled(format!("{:>3}%", percent), Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!("{:>3}%", percent),
+                Style::default().fg(theme.text_dim),
+            ),
         ]));
     }
 

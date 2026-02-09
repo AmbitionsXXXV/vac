@@ -1,9 +1,9 @@
+use rayon::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::app::{CleanableEntry, EntryKind, ItemCategory};
@@ -212,9 +212,7 @@ impl Scanner {
                 }
                 if size > 0 {
                     let name = category.as_str().to_string();
-                    let modified_at = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok();
+                    let modified_at = fs::metadata(&path).and_then(|m| m.modified()).ok();
                     let entry = CleanableEntry {
                         kind: EntryKind::Directory,
                         category: Some(category),

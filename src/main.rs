@@ -4,26 +4,34 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
+use clap::Parser;
 use color_eyre::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use vac::app::{App, EntryKind, Mode};
 use vac::cleaner::Cleaner;
+use vac::cli::Cli;
 use vac::config::AppConfig;
-use vac::scanner::{ScanKind, ScanMessage, Scanner, scanner_from_config};
+use vac::scanner::{ScanKind, ScanMessage, Scanner, format_size, scanner_from_config};
 use vac::ui;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    let cli = Cli::parse();
+
+    if cli.is_non_interactive() {
+        return run_non_interactive(cli);
+    }
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run_tui(&mut terminal);
 
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+fn run_tui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let config = AppConfig::load();
     let mut app = App::with_config(&config);
     let mut scan_rx: Option<Receiver<ScanMessage>> = None;
@@ -124,6 +132,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                             scan_rx = start_disk_scan(&mut app, path, &cancel_generation);
                         }
                     }
+                    KeyCode::Tab => app.input_tab_complete(),
+                    KeyCode::BackTab => app.input_tab_complete_prev(),
                     KeyCode::Backspace => app.input_backspace(),
                     KeyCode::Char(c) => app.input_char(c),
                     _ => {}
@@ -418,7 +428,11 @@ fn execute_clean(
     }
 
     let item_count = selected_items.len();
-    let result = Cleaner::clean(&selected_items);
+    let result = if config.safety.move_to_trash {
+        Cleaner::trash_items(&selected_items)
+    } else {
+        Cleaner::clean(&selected_items)
+    };
 
     if result.success {
         app.last_clean_result = Some((result.freed_space, item_count));
@@ -434,4 +448,431 @@ fn execute_clean(
         app.set_error(format!("部分清理失败:\n{}", error_msg));
         None
     }
+}
+
+// ── 非交互模式 ──────────────────────────────────────────────
+
+use vac::app::{CleanableEntry, SortOrder};
+use vac::cli::ScanTarget;
+
+/// 非交互模式的扫描结果条目（用于 JSON 输出）
+#[derive(serde::Serialize)]
+struct ReportEntry {
+    path: String,
+    name: String,
+    kind: String,
+    size: Option<u64>,
+    size_display: String,
+    modified_at: Option<String>,
+}
+
+/// 非交互模式的 dry-run 条目（用于 JSON 输出）
+#[derive(serde::Serialize)]
+struct DryRunReportItem {
+    path: String,
+    file_count: usize,
+    dir_count: usize,
+    size: u64,
+    size_display: String,
+}
+
+/// 非交互模式的清理结果（用于 JSON 输出）
+#[derive(serde::Serialize)]
+struct CleanReport {
+    success: bool,
+    freed_space: u64,
+    freed_space_display: String,
+    item_count: usize,
+    use_trash: bool,
+    errors: Vec<String>,
+}
+
+/// 非交互模式的完整报告（用于 JSON 输出）
+#[derive(serde::Serialize)]
+struct ScanReport {
+    scan_target: String,
+    sort_order: String,
+    total_items: usize,
+    total_size: u64,
+    total_size_display: String,
+    entries: Vec<ReportEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run: Option<DryRunReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clean_result: Option<CleanReport>,
+}
+
+/// Dry-run 报告
+#[derive(serde::Serialize)]
+struct DryRunReport {
+    total_files: usize,
+    total_dirs: usize,
+    total_size: u64,
+    total_size_display: String,
+    items: Vec<DryRunReportItem>,
+}
+
+/// 同步执行扫描并收集结果
+fn run_scan_blocking(scan_target: &ScanTarget, config: &AppConfig) -> Result<Vec<CleanableEntry>> {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicU64::new(0));
+    let job_id = 1u64;
+    cancel.store(job_id, Ordering::SeqCst);
+
+    match scan_target {
+        ScanTarget::Preset => {
+            let extra_targets = config.expanded_extra_targets();
+            let cancel_clone = cancel.clone();
+            thread::spawn(move || {
+                if let Some(scanner) = Scanner::with_extra_targets(extra_targets) {
+                    scanner.scan_root_with_progress(job_id, tx, cancel_clone);
+                } else {
+                    let _ = tx.send(ScanMessage::Error {
+                        job_id,
+                        message: "无法初始化扫描器".to_string(),
+                    });
+                }
+            });
+        }
+        ScanTarget::Home => {
+            let cancel_clone = cancel.clone();
+            thread::spawn(move || {
+                if let Some(scanner) = Scanner::new() {
+                    let home = scanner.home_dir().clone();
+                    scanner.scan_disk_with_progress(job_id, home, tx, cancel_clone);
+                } else {
+                    let _ = tx.send(ScanMessage::Error {
+                        job_id,
+                        message: "无法初始化扫描器".to_string(),
+                    });
+                }
+            });
+        }
+        ScanTarget::Path(path) => {
+            let path = path.clone();
+            let cancel_clone = cancel.clone();
+            thread::spawn(move || {
+                if let Some(scanner) = Scanner::new() {
+                    scanner.scan_disk_with_progress(job_id, path, tx, cancel_clone);
+                } else {
+                    let _ = tx.send(ScanMessage::Error {
+                        job_id,
+                        message: "无法初始化扫描器".to_string(),
+                    });
+                }
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
+    for msg in rx {
+        match msg {
+            ScanMessage::RootItem { entry, .. } => {
+                entries.push(entry);
+            }
+            ScanMessage::DirEntry { entry, .. } => {
+                entries.push(entry);
+            }
+            ScanMessage::DirEntrySize { path, size, .. } => {
+                if let Some(entry) = entries.iter_mut().find(|e| e.path == path) {
+                    entry.size = Some(size);
+                }
+            }
+            ScanMessage::Progress { progress, .. } => {
+                eprint!("\r扫描进度: {}%", progress);
+            }
+            ScanMessage::Done { .. } => {
+                eprintln!("\r扫描完成。      ");
+                break;
+            }
+            ScanMessage::Error { message, .. } => {
+                return Err(color_eyre::eyre::eyre!("扫描失败: {}", message));
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// 对条目排序
+fn sort_entries(entries: &mut [CleanableEntry], sort_order: &SortOrder) {
+    match sort_order {
+        SortOrder::ByName => {
+            entries.sort_by(|a, b| {
+                use vac::app::EntryKind;
+                match (a.kind, b.kind) {
+                    (EntryKind::Directory, EntryKind::File) => std::cmp::Ordering::Less,
+                    (EntryKind::File, EntryKind::Directory) => std::cmp::Ordering::Greater,
+                    _ => a.name.cmp(&b.name),
+                }
+            });
+        }
+        SortOrder::BySize => {
+            entries.sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
+        }
+        SortOrder::ByTime => {
+            entries.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        }
+    }
+}
+
+/// 格式化 SystemTime 为 "YYYY-MM-DD HH:MM:SS" 字符串（CLI 输出用）
+fn format_time_cli(time: &std::time::SystemTime) -> String {
+    let duration = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs() as i64;
+
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let mut remaining_days = days;
+    let mut year = 1970i32;
+
+    loop {
+        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_months: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+
+    let mut month = 0usize;
+    for (i, &dim) in days_in_months.iter().enumerate() {
+        if remaining_days < dim {
+            month = i;
+            break;
+        }
+        remaining_days -= dim;
+    }
+
+    let day = remaining_days + 1;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year,
+        month + 1,
+        day,
+        hours,
+        minutes,
+        seconds
+    )
+}
+
+/// 非交互模式入口
+fn run_non_interactive(cli: Cli) -> Result<()> {
+    let config = AppConfig::load();
+
+    let sort_order = match cli.sort.as_str() {
+        "name" => SortOrder::ByName,
+        "time" => SortOrder::ByTime,
+        _ => SortOrder::BySize,
+    };
+
+    let scan_target = cli.scan.as_ref().expect("scan target is required");
+    let scan_target_name = match scan_target {
+        ScanTarget::Preset => "preset".to_string(),
+        ScanTarget::Home => "home".to_string(),
+        ScanTarget::Path(p) => p.display().to_string(),
+    };
+
+    eprintln!("VAC - 非交互模式");
+    eprintln!("扫描目标: {}", scan_target_name);
+
+    let mut entries = run_scan_blocking(scan_target, &config)?;
+    sort_entries(&mut entries, &sort_order);
+
+    let total_size: u64 = entries.iter().filter_map(|e| e.size).sum();
+
+    // 构建报告条目
+    let report_entries: Vec<ReportEntry> = entries
+        .iter()
+        .map(|e| ReportEntry {
+            path: e.path.display().to_string(),
+            name: e.name.clone(),
+            kind: match e.kind {
+                EntryKind::Directory => "directory".to_string(),
+                EntryKind::File => "file".to_string(),
+            },
+            size: e.size,
+            size_display: e
+                .size
+                .map(format_size)
+                .unwrap_or_else(|| "未知".to_string()),
+            modified_at: e.modified_at.as_ref().map(format_time_cli),
+        })
+        .collect();
+
+    // Dry-run
+    let dry_run_report = if cli.dry_run {
+        let result = Cleaner::dry_run(&entries);
+        Some(DryRunReport {
+            total_files: result.total_files,
+            total_dirs: result.total_dirs,
+            total_size: result.total_size,
+            total_size_display: format_size(result.total_size),
+            items: result
+                .items
+                .iter()
+                .map(|item| DryRunReportItem {
+                    path: item.path.display().to_string(),
+                    file_count: item.file_count,
+                    dir_count: item.dir_count,
+                    size: item.size,
+                    size_display: format_size(item.size),
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+
+    // 清理
+    let use_trash = cli.trash || config.safety.move_to_trash;
+    let clean_report = if cli.clean && !cli.dry_run {
+        // 安全检查
+        for entry in &entries {
+            if !Cleaner::is_safe_to_delete(&entry.path) {
+                return Err(color_eyre::eyre::eyre!(
+                    "不安全的路径: {}",
+                    entry.path.display()
+                ));
+            }
+        }
+
+        let item_count = entries.len();
+        let result = if use_trash {
+            Cleaner::trash_items(&entries)
+        } else {
+            Cleaner::clean(&entries)
+        };
+
+        Some(CleanReport {
+            success: result.success,
+            freed_space: result.freed_space,
+            freed_space_display: format_size(result.freed_space),
+            item_count,
+            use_trash,
+            errors: result.errors,
+        })
+    } else {
+        None
+    };
+
+    let report = ScanReport {
+        scan_target: scan_target_name.clone(),
+        sort_order: cli.sort.clone(),
+        total_items: entries.len(),
+        total_size,
+        total_size_display: format_size(total_size),
+        entries: report_entries,
+        dry_run: dry_run_report,
+        clean_result: clean_report,
+    };
+
+    // 输出结果
+    if let Some(ref output_path) = cli.output {
+        let json = serde_json::to_string_pretty(&report)?;
+        std::fs::write(output_path, &json)?;
+        eprintln!("报告已写入: {}", output_path.display());
+    } else {
+        // 输出到终端
+        print_report_to_terminal(&report, &entries, use_trash);
+    }
+
+    Ok(())
+}
+
+/// 将报告输出到终端
+fn print_report_to_terminal(report: &ScanReport, entries: &[CleanableEntry], use_trash: bool) {
+    println!();
+    println!(
+        "扫描结果: {} 个项目 | 总大小: {}",
+        report.total_items, report.total_size_display
+    );
+    println!("{}", "─".repeat(70));
+
+    for entry in entries {
+        let kind_icon = match entry.kind {
+            EntryKind::Directory => "📁",
+            EntryKind::File => "📄",
+        };
+        let size_str = entry
+            .size
+            .map(format_size)
+            .unwrap_or_else(|| "未知".to_string());
+        let time_str = entry
+            .modified_at
+            .as_ref()
+            .map(|t| format!("  {}", format_time_cli(t)))
+            .unwrap_or_default();
+
+        println!(
+            "  {} {:>10}  {}{}",
+            kind_icon, size_str, entry.name, time_str
+        );
+    }
+    println!("{}", "─".repeat(70));
+
+    // Dry-run 结果
+    if let Some(ref dry_run) = report.dry_run {
+        println!();
+        println!("Dry-run 预览:");
+        println!(
+            "  总计: {} 个文件 / {} 个目录 / {}",
+            dry_run.total_files, dry_run.total_dirs, dry_run.total_size_display
+        );
+        for item in &dry_run.items {
+            println!(
+                "  • {} — {} 文件 / {} 目录 / {}",
+                item.path, item.file_count, item.dir_count, item.size_display
+            );
+        }
+    }
+
+    // 清理结果
+    if let Some(ref clean) = report.clean_result {
+        println!();
+        let action = if use_trash {
+            "移至回收站"
+        } else {
+            "已删除"
+        };
+        if clean.success {
+            println!(
+                "{}: {} ({} 个项目)",
+                action, clean.freed_space_display, clean.item_count
+            );
+        } else {
+            println!("清理部分失败:");
+            for err in &clean.errors {
+                println!("  ✗ {}", err);
+            }
+        }
+    }
+
+    println!();
 }
