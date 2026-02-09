@@ -1,7 +1,10 @@
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
+use crate::cleaner::DryRunResult;
+use crate::config::AppConfig;
 use crate::scanner::ScanKind;
 
 /// 应用运行模式
@@ -19,6 +22,8 @@ pub enum Mode {
     InputPath,
     /// 搜索模式
     Search,
+    /// 统计面板
+    Stats,
 }
 
 /// 排序方式
@@ -29,6 +34,8 @@ pub enum SortOrder {
     ByName,
     /// 按大小降序排序
     BySize,
+    /// 按修改时间降序排序（最新在前）
+    ByTime,
 }
 
 impl SortOrder {
@@ -36,13 +43,15 @@ impl SortOrder {
         match self {
             SortOrder::ByName => "名称",
             SortOrder::BySize => "大小",
+            SortOrder::ByTime => "时间",
         }
     }
 
     pub fn toggle(&self) -> Self {
         match self {
             SortOrder::ByName => SortOrder::BySize,
-            SortOrder::BySize => SortOrder::ByName,
+            SortOrder::BySize => SortOrder::ByTime,
+            SortOrder::ByTime => SortOrder::ByName,
         }
     }
 }
@@ -78,6 +87,8 @@ pub enum ItemCategory {
     DockerData,
     /// Cargo 缓存
     CargoCache,
+    /// 用户自定义扫描目标
+    Custom,
 }
 
 impl ItemCategory {
@@ -97,6 +108,7 @@ impl ItemCategory {
             ItemCategory::CargoCache => "Cargo 缓存",
             ItemCategory::Downloads => "下载文件夹",
             ItemCategory::Trash => "垃圾桶",
+            ItemCategory::Custom => "自定义目标",
         }
     }
 
@@ -116,6 +128,7 @@ impl ItemCategory {
             ItemCategory::CargoCache => "Cargo registry 下载缓存",
             ItemCategory::Downloads => "下载文件夹中的文件",
             ItemCategory::Trash => "回收站中的文件",
+            ItemCategory::Custom => "用户配置的自定义扫描目标",
         }
     }
 }
@@ -135,6 +148,8 @@ pub struct CleanableEntry {
     pub path: PathBuf,
     pub name: String,
     pub size: Option<u64>,
+    /// 最后修改时间
+    pub modified_at: Option<SystemTime>,
 }
 
 /// 选中条目
@@ -250,6 +265,10 @@ pub struct App {
     pub search_query: String,
     /// 搜索前的原始条目（用于取消搜索时恢复）
     pub pre_search_entries: Vec<CleanableEntry>,
+    /// Dry-run 结果
+    pub dry_run_result: Option<DryRunResult>,
+    /// 确认弹窗中是否显示 dry-run 视图
+    pub dry_run_active: bool,
 }
 
 impl Default for App {
@@ -260,8 +279,19 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_config(&AppConfig::default())
+    }
+
+    /// 从配置创建应用实例
+    pub fn with_config(config: &AppConfig) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+
+        let sort_order = match config.ui.default_sort.as_deref() {
+            Some("size") => SortOrder::BySize,
+            Some("time") => SortOrder::ByTime,
+            _ => SortOrder::ByName,
+        };
 
         Self {
             mode: Mode::Normal,
@@ -279,13 +309,15 @@ impl App {
             scan_generation: 0,
             scan_kind: ScanKind::Root,
             scan_in_progress: false,
-            sort_order: SortOrder::default(),
+            sort_order,
             input_buffer: String::new(),
             visible_height: 20,
             last_clean_result: None,
             confirm_scroll: 0,
             search_query: String::new(),
             pre_search_entries: Vec::new(),
+            dry_run_result: None,
+            dry_run_active: false,
         }
     }
 
@@ -454,14 +486,13 @@ impl App {
         self.set_entries(cached_entries);
         self.sort_dir_entries();
 
-        if let Some(selected_path) = selected_path {
-            if let Some(restored_index) = self
+        if let Some(selected_path) = selected_path
+            && let Some(restored_index) = self
                 .entries
                 .iter()
                 .position(|entry| entry.path == selected_path)
-            {
-                self.list_state.select(Some(restored_index));
-            }
+        {
+            self.list_state.select(Some(restored_index));
         }
     }
 
@@ -533,6 +564,10 @@ impl App {
                 self.root_entries
                     .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
             }
+            SortOrder::ByTime => {
+                self.root_entries
+                    .sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+            }
         }
         if self.navigation.current_path.is_none() {
             self.set_entries(self.root_entries.clone());
@@ -552,6 +587,10 @@ impl App {
             SortOrder::BySize => {
                 self.entries
                     .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
+            }
+            SortOrder::ByTime => {
+                self.entries
+                    .sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
             }
         }
         if !self.entries.is_empty() {
@@ -582,6 +621,7 @@ impl App {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string()),
                 size: entry.size,
+                modified_at: None,
             })
             .collect()
     }
@@ -590,12 +630,16 @@ impl App {
     pub fn enter_confirm_mode(&mut self) {
         if self.selected_size > 0 {
             self.confirm_scroll = 0;
+            self.dry_run_result = None;
+            self.dry_run_active = false;
             self.mode = Mode::Confirm;
         }
     }
 
     /// 取消确认
     pub fn cancel_confirm(&mut self) {
+        self.dry_run_result = None;
+        self.dry_run_active = false;
         self.mode = Mode::Normal;
     }
 
@@ -733,6 +777,35 @@ impl App {
         self.input_buffer.clear();
         self.mode = Mode::Normal;
     }
+
+    /// 切换统计面板
+    pub fn toggle_stats(&mut self) {
+        if self.root_entries.is_empty() {
+            return;
+        }
+        self.mode = if self.mode == Mode::Stats {
+            Mode::Normal
+        } else {
+            Mode::Stats
+        };
+    }
+
+    /// 按分类聚合统计信息，返回 (分类名, 总大小) 按大小降序
+    pub fn get_category_stats(&self) -> Vec<(String, u64)> {
+        let mut stats: HashMap<String, u64> = HashMap::new();
+        for entry in &self.root_entries {
+            let category_name = entry
+                .category
+                .as_ref()
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_else(|| "其他".to_string());
+            let size = entry.size.unwrap_or(0);
+            *stats.entry(category_name).or_insert(0) += size;
+        }
+        let mut result: Vec<(String, u64)> = stats.into_iter().collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
+    }
 }
 
 #[cfg(test)]
@@ -747,6 +820,7 @@ mod tests {
             path: PathBuf::from(path),
             name: "item".to_string(),
             size,
+            modified_at: None,
         }
     }
 
@@ -757,6 +831,7 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}")),
             name: name.to_string(),
             size,
+            modified_at: None,
         }
     }
 
@@ -859,7 +934,11 @@ mod tests {
         ];
         app.sort_order = SortOrder::BySize;
 
-        // 切换到 ByName
+        // BySize -> ByTime
+        app.toggle_sort_order();
+        assert_eq!(app.sort_order, SortOrder::ByTime);
+
+        // ByTime -> ByName
         app.toggle_sort_order();
         assert_eq!(app.sort_order, SortOrder::ByName);
         let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();

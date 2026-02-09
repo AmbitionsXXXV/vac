@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -61,12 +60,23 @@ impl ScanMessage {
 /// 磁盘扫描器
 pub struct Scanner {
     home_dir: PathBuf,
+    /// 用户配置的额外扫描目标
+    extra_targets: Vec<PathBuf>,
 }
 
 impl Scanner {
     pub fn new() -> Option<Self> {
         directories::UserDirs::new().map(|dirs| Self {
             home_dir: dirs.home_dir().to_path_buf(),
+            extra_targets: Vec::new(),
+        })
+    }
+
+    /// 带额外扫描目标创建
+    pub fn with_extra_targets(extra_targets: Vec<PathBuf>) -> Option<Self> {
+        directories::UserDirs::new().map(|dirs| Self {
+            home_dir: dirs.home_dir().to_path_buf(),
+            extra_targets,
         })
     }
 
@@ -133,6 +143,13 @@ impl Scanner {
             targets.push((ItemCategory::CargoCache, cargo_cache));
         }
 
+        // 用户配置的额外扫描目标
+        for extra_path in &self.extra_targets {
+            if extra_path.exists() {
+                targets.push((ItemCategory::Custom, extra_path.clone()));
+            }
+        }
+
         targets
     }
 
@@ -195,12 +212,16 @@ impl Scanner {
                 }
                 if size > 0 {
                     let name = category.as_str().to_string();
+                    let modified_at = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok();
                     let entry = CleanableEntry {
                         kind: EntryKind::Directory,
                         category: Some(category),
                         path,
                         name,
                         size: Some(size),
+                        modified_at,
                     };
                     let _ = tx.send(ScanMessage::RootItem { job_id, entry });
                 }
@@ -255,22 +276,27 @@ impl Scanner {
 
             if file_type.is_dir() {
                 dir_paths.push(entry_path.clone());
+                let modified_at = entry.metadata().ok().and_then(|m| m.modified().ok());
                 let entry = CleanableEntry {
                     kind: EntryKind::Directory,
                     category: None,
                     path: entry_path,
                     name,
                     size: None,
+                    modified_at,
                 };
                 let _ = tx.send(ScanMessage::DirEntry { job_id, entry });
             } else if file_type.is_file() {
-                let size = entry.metadata().ok().map(|m| m.len());
+                let metadata = entry.metadata().ok();
+                let size = metadata.as_ref().map(|m| m.len());
+                let modified_at = metadata.and_then(|m| m.modified().ok());
                 let entry = CleanableEntry {
                     kind: EntryKind::File,
                     category: None,
                     path: entry_path,
                     name,
                     size,
+                    modified_at,
                 };
                 let _ = tx.send(ScanMessage::DirEntry { job_id, entry });
             }
@@ -367,22 +393,27 @@ impl Scanner {
 
             if file_type.is_dir() {
                 dir_paths.push(entry_path.clone());
+                let modified_at = entry.metadata().ok().and_then(|m| m.modified().ok());
                 let entry = CleanableEntry {
                     kind: EntryKind::Directory,
                     category: None,
                     path: entry_path,
                     name,
                     size: None,
+                    modified_at,
                 };
                 let _ = tx.send(ScanMessage::RootItem { job_id, entry });
             } else if file_type.is_file() {
-                let size = entry.metadata().ok().map(|m| m.len());
+                let metadata = entry.metadata().ok();
+                let size = metadata.as_ref().map(|m| m.len());
+                let modified_at = metadata.and_then(|m| m.modified().ok());
                 let entry = CleanableEntry {
                     kind: EntryKind::File,
                     category: None,
                     path: entry_path,
                     name,
                     size,
+                    modified_at,
                 };
                 let _ = tx.send(ScanMessage::RootItem { job_id, entry });
             }
@@ -422,6 +453,12 @@ impl Default for Scanner {
     fn default() -> Self {
         Self::new().expect("无法获取用户目录")
     }
+}
+
+/// 根据配置创建 Scanner
+pub fn scanner_from_config(config: &crate::config::AppConfig) -> Option<Scanner> {
+    let extra_targets = config.expanded_extra_targets();
+    Scanner::with_extra_targets(extra_targets)
 }
 
 /// 计算目录大小（可取消），独立函数以支持 rayon 并行调用

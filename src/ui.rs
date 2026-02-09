@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::app::{App, EntryKind, Mode, SortOrder};
 use crate::scanner::format_size;
@@ -66,6 +67,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Confirm => render_confirm_popup(frame, app, &theme),
         Mode::InputPath => render_input_popup(frame, app, &theme),
         Mode::Search => render_search_bar(frame, app, &theme),
+        Mode::Stats => render_stats_popup(frame, app, &theme),
         _ => {}
     }
 
@@ -223,7 +225,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 EntryKind::Directory => format!("{}/", entry.name),
                 EntryKind::File => entry.name.clone(),
             };
-            let line = Line::from(vec![
+            let time_str = entry
+                .modified_at
+                .as_ref()
+                .map(format_time)
+                .unwrap_or_default();
+            let mut spans = vec![
                 Span::styled(
                     checkbox,
                     Style::default().fg(if selected {
@@ -236,8 +243,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 Span::styled(name, Style::default().fg(theme.text)),
                 Span::raw(" "),
                 Span::styled(format!("({})", size), Style::default().fg(theme.warning)),
-            ]);
-            ListItem::new(line)
+            ];
+            if !time_str.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(time_str, Style::default().fg(theme.text_dim)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -273,10 +284,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let sort_indicator = match app.sort_order {
         SortOrder::ByName => "[排序:名称]",
         SortOrder::BySize => "[排序:大小]",
+        SortOrder::ByTime => "[排序:时间]",
     };
 
     let base_help = format!(
-        "s: 扫描 | S: 扫描主目录 | d: 自定义路径 | o: 切换排序 {} | ↑/↓: 移动 | Space: 选择 | c: 清理 | ?: 帮助 | q: 退出",
+        "s: 扫描 | S: 扫描主目录 | d: 自定义路径 | o: 排序 {} | t: 统计 | Space: 选择 | c: 清理 | ?: 帮助 | q: 退出",
         sort_indicator
     );
 
@@ -296,8 +308,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             }
         }
         Mode::Scanning => "扫描中，请稍候... | Esc: 取消".to_string(),
-        Mode::Confirm => "Enter: 确认删除 | Esc: 取消".to_string(),
+        Mode::Confirm => "Enter: 确认删除 | d: 详情预览 | Esc: 取消".to_string(),
         Mode::Help => "按任意键关闭帮助".to_string(),
+        Mode::Stats => "按任意键关闭统计".to_string(),
         Mode::InputPath => "输入路径后按 Enter 确认 | Esc: 取消".to_string(),
         Mode::Search => "Enter: 确认搜索 | Esc: 取消搜索".to_string(),
     };
@@ -385,7 +398,7 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
         ]),
         Line::from(vec![
             Span::styled("  o          ", Style::default().fg(theme.accent)),
-            Span::raw("切换排序方式 (名称/大小)"),
+            Span::raw("切换排序方式 (名称/大小/时间)"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -409,6 +422,10 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
             "其他",
             Style::default().fg(theme.secondary).bold(),
         )),
+        Line::from(vec![
+            Span::styled("  t          ", Style::default().fg(theme.accent)),
+            Span::raw("空间占用统计"),
+        ]),
         Line::from(vec![
             Span::styled("  ?          ", Style::default().fg(theme.accent)),
             Span::raw("显示/隐藏帮助"),
@@ -493,6 +510,11 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = centered_rect(60, 60, frame.area());
     frame.render_widget(Clear, area);
 
+    if app.dry_run_active {
+        render_dry_run_view(frame, area, app, theme);
+        return;
+    }
+
     let selected_count = app.selections.len();
 
     // 收集待删路径，按大小降序
@@ -555,6 +577,8 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     lines.push(Line::from(vec![
         Span::styled("Enter", Style::default().fg(theme.accent)),
         Span::raw(" 确认 | "),
+        Span::styled("d", Style::default().fg(theme.accent)),
+        Span::raw(" 详情预览 | "),
         Span::styled("Esc", Style::default().fg(theme.accent)),
         Span::raw(" 取消 | "),
         Span::styled("j/k", Style::default().fg(theme.accent)),
@@ -570,6 +594,96 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     );
 
     frame.render_widget(confirm, area);
+}
+
+/// 渲染 dry-run 详情视图
+fn render_dry_run_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "🔍 删除预览 (Dry-run)",
+            Style::default().fg(theme.primary).bold(),
+        )),
+        Line::from(""),
+    ];
+
+    if let Some(ref result) = app.dry_run_result {
+        lines.push(Line::from(vec![
+            Span::styled("总计: ", Style::default().fg(theme.text)),
+            Span::styled(
+                format!("{} 个文件", result.total_files),
+                Style::default().fg(theme.warning),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                format!("{} 个目录", result.total_dirs),
+                Style::default().fg(theme.secondary),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                format_size(result.total_size),
+                Style::default().fg(theme.danger),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        let visible_height = area.height.saturating_sub(11) as usize;
+        let scroll = app
+            .confirm_scroll
+            .min(result.items.len().saturating_sub(visible_height));
+
+        for item in result.items.iter().skip(scroll).take(visible_height) {
+            let name: String = item
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| item.path.display().to_string());
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(theme.text_dim)),
+                Span::styled(name, Style::default().fg(theme.text)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("{} 文件", item.file_count),
+                    Style::default().fg(theme.warning),
+                ),
+                Span::raw(" / "),
+                Span::styled(
+                    format!("{} 目录", item.dir_count),
+                    Style::default().fg(theme.secondary),
+                ),
+                Span::raw(" / "),
+                Span::styled(format_size(item.size), Style::default().fg(theme.danger)),
+            ]));
+        }
+
+        if result.items.len() > visible_height {
+            lines.push(Line::from(Span::styled(
+                format!("  ... 共 {} 项，j/k 滚动", result.items.len()),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(theme.accent)),
+        Span::raw(" 确认删除 | "),
+        Span::styled("d", Style::default().fg(theme.accent)),
+        Span::raw(" 返回列表 | "),
+        Span::styled("Esc", Style::default().fg(theme.accent)),
+        Span::raw(" 取消"),
+    ]));
+
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(theme.primary))
+            .padding(Padding::uniform(1)),
+    );
+
+    frame.render_widget(popup, area);
 }
 
 /// 渲染错误弹窗
@@ -602,6 +716,76 @@ fn render_error_popup(frame: &mut Frame, app: &App, theme: &Theme) {
 
         frame.render_widget(error, area);
     }
+}
+
+/// 渲染统计面板弹窗
+fn render_stats_popup(frame: &mut Frame, app: &App, theme: &Theme) {
+    let area = centered_rect(70, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let stats = app.get_category_stats();
+    let total_size: u64 = stats.iter().map(|(_, s)| *s).sum();
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "空间占用统计",
+            Style::default().fg(theme.primary).bold(),
+        )),
+        Line::from(""),
+    ];
+
+    // 进度条宽度（字符数）
+    let bar_width = 20usize;
+
+    for (category_name, size) in &stats {
+        let percent = if total_size > 0 {
+            (*size as f64 / total_size as f64 * 100.0) as u16
+        } else {
+            0
+        };
+        let filled = (percent as usize * bar_width / 100).min(bar_width);
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+
+        // 分类名固定宽度对齐
+        let padded_name = format!("{:<14}", category_name);
+        let size_str = format!("{:>10}", format_size(*size));
+
+        lines.push(Line::from(vec![
+            Span::styled(padded_name, Style::default().fg(theme.text)),
+            Span::raw(" "),
+            Span::styled(size_str, Style::default().fg(theme.warning)),
+            Span::raw("  "),
+            Span::styled(bar, Style::default().fg(theme.accent)),
+            Span::raw("  "),
+            Span::styled(format!("{:>3}%", percent), Style::default().fg(theme.text_dim)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("总计: ", Style::default().fg(theme.text)),
+        Span::styled(
+            format_size(total_size),
+            Style::default().fg(theme.warning).bold(),
+        ),
+        Span::raw(format!(" ({} 个分类)", stats.len())),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "按任意键关闭",
+        Style::default().fg(theme.text_dim),
+    )));
+
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .title(" 统计 ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(theme.primary))
+            .padding(Padding::uniform(1)),
+    );
+
+    frame.render_widget(popup, area);
 }
 
 /// 渲染搜索栏（底部浮层）
@@ -637,6 +821,60 @@ fn render_search_bar(frame: &mut Frame, app: &App, theme: &Theme) {
     );
 
     frame.render_widget(bar, bar_area);
+}
+
+/// 格式化 SystemTime 为 "YYYY-MM-DD" 字符串
+fn format_time(time: &SystemTime) -> String {
+    let duration = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs() as i64;
+
+    // 简单日期计算（不引入额外依赖）
+    let days = secs / 86400;
+    let mut remaining_days = days;
+    let mut year = 1970i32;
+
+    loop {
+        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_months: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+
+    let mut month = 0usize;
+    for (i, &dim) in days_in_months.iter().enumerate() {
+        if remaining_days < dim {
+            month = i;
+            break;
+        }
+        remaining_days -= dim;
+    }
+
+    let day = remaining_days + 1;
+    format!("{:04}-{:02}-{:02}", year, month + 1, day)
 }
 
 /// 计算居中矩形区域

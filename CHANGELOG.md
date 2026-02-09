@@ -2,21 +2,27 @@
 
 All notable changes to VAC will be documented in this file.
 
-## [unreleased]
+## [0.3.0] - 2026-02-09
 
 ### ✨ Features
 
-- Make directory navigation more responsive by restoring the previous listing when going back.
+- Cache back navigation and persist sort order
 
-- Keep sort order consistent across the root view and subdirectories.
+- Restore cached listing and scroll position when navigating back, no rescan needed
+- Apply sort order consistently across root view and subdirectories
+- Add `config.rs` module: load user config from `~/.config/vac/config.toml`
+- Support `extra_targets` for additional scan directories (with `~` expansion)
+- Support `default_sort` to set initial sort order via config file
 
 ### 🧪 Testing
 
-- Add `cargo-nextest` configuration and document the recommended test workflow.
+- Add `cargo-nextest` configuration and document the recommended test workflow
+- Add unit tests for config parsing, navigation cache, and root sorting
 
 ### 📚 Documentation
 
-- Document navigation caching and persistent sorting behavior in the architecture guide.
+- Document navigation caching and persistent sorting in the architecture guide
+- Add config module documentation to architecture and usage docs
 
 ## [0.2.0] - 2026-02-07
 
@@ -43,6 +49,11 @@ All notable changes to VAC will be documented in this file.
 ### 📚 Documentation
 
 - Add README.md for VAC, detailing features, usage, and safety tips
+
+### ⚙️ Miscellaneous
+
+- Add git-cliff generated CHANGELOG.md and update cliff.toml template
+
 ## [0.1.0] - 2026-02-03
 
 ### 🌱 Init

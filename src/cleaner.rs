@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use walkdir::WalkDir;
+
 use crate::app::CleanableEntry;
 
 /// 清理结果
@@ -9,6 +11,24 @@ pub struct CleanResult {
     pub success: bool,
     pub freed_space: u64,
     pub errors: Vec<String>,
+}
+
+/// Dry-run 单项详情
+#[derive(Debug, Clone)]
+pub struct DryRunItem {
+    pub path: std::path::PathBuf,
+    pub file_count: usize,
+    pub dir_count: usize,
+    pub size: u64,
+}
+
+/// Dry-run 结果（不执行实际删除）
+#[derive(Debug, Clone)]
+pub struct DryRunResult {
+    pub total_files: usize,
+    pub total_dirs: usize,
+    pub total_size: u64,
+    pub items: Vec<DryRunItem>,
 }
 
 /// 磁盘清理器
@@ -36,6 +56,71 @@ impl Cleaner {
             freed_space,
             errors,
         }
+    }
+
+    /// 模拟删除，统计将要删除的文件数、目录数和大小
+    pub fn dry_run(items: &[CleanableEntry]) -> DryRunResult {
+        let mut total_files = 0usize;
+        let mut total_dirs = 0usize;
+        let mut total_size = 0u64;
+        let mut dry_run_items = Vec::new();
+
+        for item in items {
+            let (file_count, dir_count, size) = Self::count_path_contents(&item.path);
+            total_files += file_count;
+            total_dirs += dir_count;
+            total_size += size;
+            dry_run_items.push(DryRunItem {
+                path: item.path.clone(),
+                file_count,
+                dir_count,
+                size,
+            });
+        }
+
+        DryRunResult {
+            total_files,
+            total_dirs,
+            total_size,
+            items: dry_run_items,
+        }
+    }
+
+    /// 统计路径下的文件数、目录数和总大小
+    fn count_path_contents(path: &Path) -> (usize, usize, u64) {
+        if !path.exists() {
+            return (0, 0, 0);
+        }
+
+        if path.is_file() {
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            return (1, 0, size);
+        }
+
+        let mut file_count = 0usize;
+        let mut dir_count = 0usize;
+        let mut size = 0u64;
+
+        for entry in WalkDir::new(path).follow_links(false).into_iter() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            // 跳过根路径本身（目录内容清理保留目录结构）
+            if entry.path() == path {
+                continue;
+            }
+            if entry.file_type().is_file() {
+                file_count += 1;
+                if let Ok(m) = entry.metadata() {
+                    size += m.len();
+                }
+            } else if entry.file_type().is_dir() {
+                dir_count += 1;
+            }
+        }
+
+        (file_count, dir_count, size)
     }
 
     /// 删除指定路径（文件或目录）
@@ -169,6 +254,7 @@ mod tests {
             path,
             name: "item".to_string(),
             size,
+            modified_at: None,
         }
     }
 
@@ -240,5 +326,43 @@ mod tests {
         assert!(!file_path.exists());
         assert!(dir_path.exists());
         assert_eq!(fs::read_dir(&dir_path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn dry_run_counts_correctly() {
+        let dir = tempfile::Builder::new()
+            .prefix("vac-dryrun-")
+            .tempdir_in("/tmp")
+            .expect("create temp dir");
+
+        // 创建已知结构: 2 个文件 + 1 个子目录（含 1 个文件）
+        let file_a = dir.path().join("a.txt");
+        fs::write(&file_a, b"hello").expect("write file a");
+
+        let file_b = dir.path().join("b.txt");
+        fs::write(&file_b, vec![0u8; 10]).expect("write file b");
+
+        let sub_dir = dir.path().join("sub");
+        fs::create_dir(&sub_dir).expect("create sub dir");
+        let file_c = sub_dir.join("c.txt");
+        fs::write(&file_c, b"world").expect("write file c");
+
+        let dir_item = CleanableEntry {
+            kind: EntryKind::Directory,
+            category: None,
+            path: dir.path().to_path_buf(),
+            name: "test".to_string(),
+            size: Some(20),
+            modified_at: None,
+        };
+
+        let result = Cleaner::dry_run(&[dir_item]);
+
+        assert_eq!(result.total_files, 3);
+        assert_eq!(result.total_dirs, 1);
+        assert_eq!(result.total_size, 20); // 5 + 10 + 5
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].file_count, 3);
+        assert_eq!(result.items[0].dir_count, 1);
     }
 }
