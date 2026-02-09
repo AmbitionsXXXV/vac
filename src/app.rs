@@ -269,6 +269,12 @@ pub struct App {
     pub dry_run_result: Option<DryRunResult>,
     /// 确认弹窗中是否显示 dry-run 视图
     pub dry_run_active: bool,
+    /// 是否启用回收站模式（移至回收站而非永久删除）
+    pub use_trash: bool,
+    /// Tab 补全候选列表（保留原始 ~ 前缀的显示字符串）
+    pub tab_completions: Vec<String>,
+    /// Tab 补全当前选中索引
+    pub tab_completion_index: Option<usize>,
 }
 
 impl Default for App {
@@ -318,6 +324,9 @@ impl App {
             pre_search_entries: Vec::new(),
             dry_run_result: None,
             dry_run_active: false,
+            use_trash: config.safety.move_to_trash,
+            tab_completions: Vec::new(),
+            tab_completion_index: None,
         }
     }
 
@@ -738,17 +747,20 @@ impl App {
     /// 进入路径输入模式
     pub fn start_input(&mut self) {
         self.input_buffer.clear();
+        self.reset_tab_completions();
         self.mode = Mode::InputPath;
     }
 
     /// 输入字符
     pub fn input_char(&mut self, c: char) {
         self.input_buffer.push(c);
+        self.reset_tab_completions();
     }
 
     /// 删除输入字符
     pub fn input_backspace(&mut self) {
         self.input_buffer.pop();
+        self.reset_tab_completions();
     }
 
     /// 确认输入并返回路径
@@ -775,7 +787,141 @@ impl App {
     /// 取消输入
     pub fn cancel_input(&mut self) {
         self.input_buffer.clear();
+        self.reset_tab_completions();
         self.mode = Mode::Normal;
+    }
+
+    /// 将路径中的 `~` 展开为主目录绝对路径
+    fn expand_input_tilde(raw: &str) -> String {
+        if raw.starts_with('~') {
+            if let Some(home) = directories::UserDirs::new() {
+                let home_str = home.home_dir().display().to_string();
+                return raw.replacen('~', &home_str, 1);
+            }
+        }
+        raw.to_string()
+    }
+
+    /// Tab 正向补全/循环
+    pub fn input_tab_complete(&mut self) {
+        // 已有候选列表时，正向循环
+        if !self.tab_completions.is_empty() {
+            if let Some(index) = self.tab_completion_index {
+                let next_index = (index + 1) % self.tab_completions.len();
+                self.tab_completion_index = Some(next_index);
+                self.input_buffer = self.tab_completions[next_index].clone();
+            }
+            return;
+        }
+
+        self.build_tab_completions();
+    }
+
+    /// Shift+Tab 反向循环
+    pub fn input_tab_complete_prev(&mut self) {
+        if self.tab_completions.is_empty() {
+            self.build_tab_completions();
+            return;
+        }
+
+        if let Some(index) = self.tab_completion_index {
+            let prev_index = if index == 0 {
+                self.tab_completions.len() - 1
+            } else {
+                index - 1
+            };
+            self.tab_completion_index = Some(prev_index);
+            self.input_buffer = self.tab_completions[prev_index].clone();
+        }
+    }
+
+    /// 构建 Tab 补全候选列表
+    fn build_tab_completions(&mut self) {
+        let raw_input = self.input_buffer.trim();
+        if raw_input.is_empty() {
+            return;
+        }
+
+        let expanded = Self::expand_input_tilde(raw_input);
+        let expanded_path = std::path::Path::new(&expanded);
+
+        // 分离 parent_dir 和 prefix
+        // 如果输入以 / 结尾，则 parent 是整个路径，prefix 为空
+        let (parent_dir, prefix) = if expanded.ends_with('/') {
+            (expanded.clone(), String::new())
+        } else if let Some(parent) = expanded_path.parent() {
+            let file_name = expanded_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (parent.display().to_string(), file_name)
+        } else {
+            return;
+        };
+
+        // 确定原始输入中 ~ 对应的前缀部分，用于重建显示字符串
+        let uses_tilde = raw_input.starts_with('~');
+        let home_str = if uses_tilde {
+            directories::UserDirs::new().map(|h| h.home_dir().display().to_string())
+        } else {
+            None
+        };
+
+        // 读取 parent_dir 中的目录条目
+        let read_dir = match std::fs::read_dir(&parent_dir) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+
+        let mut completions: Vec<String> = Vec::new();
+        let prefix_lower = prefix.to_lowercase();
+
+        for dir_entry in read_dir.flatten() {
+            let file_type = match dir_entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_name = dir_entry.file_name().to_string_lossy().to_string();
+            if !prefix.is_empty() && !entry_name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+
+            // 重建显示路径
+            let full_expanded = format!(
+                "{}{}{}/",
+                parent_dir,
+                if parent_dir.ends_with('/') { "" } else { "/" },
+                entry_name
+            );
+
+            // 如果原始输入使用了 ~，将主目录替换回 ~
+            let display_path = if let Some(ref home) = home_str {
+                full_expanded.replacen(home.as_str(), "~", 1)
+            } else {
+                full_expanded
+            };
+
+            completions.push(display_path);
+        }
+
+        completions.sort();
+
+        if completions.is_empty() {
+            return;
+        }
+
+        self.tab_completions = completions;
+        self.tab_completion_index = Some(0);
+        self.input_buffer = self.tab_completions[0].clone();
+    }
+
+    /// 清空 Tab 补全状态
+    pub fn reset_tab_completions(&mut self) {
+        self.tab_completions.clear();
+        self.tab_completion_index = None;
     }
 
     /// 切换统计面板

@@ -35,7 +35,7 @@ pub struct DryRunResult {
 pub struct Cleaner;
 
 impl Cleaner {
-    /// 清理选中的项目
+    /// 清理选中的项目（永久删除）
     pub fn clean(items: &[CleanableEntry]) -> CleanResult {
         let mut freed_space = 0u64;
         let mut errors = Vec::new();
@@ -55,6 +55,65 @@ impl Cleaner {
             success: errors.is_empty(),
             freed_space,
             errors,
+        }
+    }
+
+    /// 将选中的项目移至系统回收站
+    pub fn trash_items(items: &[CleanableEntry]) -> CleanResult {
+        let mut freed_space = 0u64;
+        let mut errors = Vec::new();
+
+        for item in items {
+            if !item.path.exists() {
+                continue;
+            }
+            if item.path.is_dir() {
+                // 对目录：移动目录内容至回收站，保留目录本身
+                match Self::trash_dir_contents(&item.path) {
+                    Ok(()) => {
+                        freed_space += item.size.unwrap_or(0);
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", item.path.display(), e));
+                    }
+                }
+            } else {
+                match trash::delete(&item.path) {
+                    Ok(()) => {
+                        freed_space += item.size.unwrap_or(0);
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", item.path.display(), e));
+                    }
+                }
+            }
+        }
+
+        CleanResult {
+            success: errors.is_empty(),
+            freed_space,
+            errors,
+        }
+    }
+
+    /// 将目录内容移至回收站，保留目录结构本身
+    fn trash_dir_contents(path: &Path) -> Result<(), String> {
+        let entries: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .collect();
+
+        let mut errors = Vec::new();
+        for entry in entries {
+            if let Err(e) = trash::delete(entry.path()) {
+                errors.push(format!("{}: {}", entry.path().display(), e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
@@ -326,6 +385,72 @@ mod tests {
         assert!(!file_path.exists());
         assert!(dir_path.exists());
         assert_eq!(fs::read_dir(&dir_path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trash_items_moves_files_to_trash() {
+        let dir = tempfile::Builder::new()
+            .prefix("vac-trash-")
+            .tempdir_in("/tmp")
+            .expect("create temp dir");
+
+        let file_path = dir.path().join("trash_me.txt");
+        fs::write(&file_path, b"trash test").expect("write file");
+
+        let file_item = CleanableEntry {
+            kind: EntryKind::File,
+            category: None,
+            path: file_path.clone(),
+            name: "trash_me.txt".to_string(),
+            size: Some(10),
+            modified_at: None,
+        };
+
+        let result = Cleaner::trash_items(&[file_item]);
+        assert!(result.success);
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn trash_items_moves_dir_contents_to_trash() {
+        let dir = tempfile::Builder::new()
+            .prefix("vac-trash-dir-")
+            .tempdir_in("/tmp")
+            .expect("create temp dir");
+
+        let file_a = dir.path().join("a.txt");
+        fs::write(&file_a, b"hello").expect("write file a");
+
+        let dir_item = CleanableEntry {
+            kind: EntryKind::Directory,
+            category: None,
+            path: dir.path().to_path_buf(),
+            name: "test-dir".to_string(),
+            size: Some(5),
+            modified_at: None,
+        };
+
+        let result = Cleaner::trash_items(&[dir_item]);
+        assert!(result.success);
+        // 目录本身保留，但文件已移至回收站
+        assert!(dir.path().exists());
+        assert!(!file_a.exists());
+    }
+
+    #[test]
+    fn trash_items_skips_nonexistent_paths() {
+        let item = CleanableEntry {
+            kind: EntryKind::File,
+            category: None,
+            path: PathBuf::from("/tmp/vac-nonexistent-trash-12345"),
+            name: "nonexistent".to_string(),
+            size: Some(0),
+            modified_at: None,
+        };
+
+        let result = Cleaner::trash_items(&[item]);
+        assert!(result.success);
+        assert_eq!(result.freed_space, 0);
     }
 
     #[test]
