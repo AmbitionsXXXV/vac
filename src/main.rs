@@ -204,7 +204,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         }
                     });
                     if let Some(target) = target {
-                        app.navigation.enter(target.clone());
+                        let selected_index = app.list_state.selected();
+                        app.navigation
+                            .enter(target.clone(), app.entries.clone(), selected_index);
                         scan_rx = start_dir_scan(&mut app, target, &cancel_generation);
                     }
                 }
@@ -213,9 +215,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         if app.scan_in_progress {
                             cancel_scan(&mut app, &cancel_generation, &mut scan_rx);
                         }
-                        app.navigation.back();
-                        if let Some(path) = app.navigation.current_path.clone() {
-                            scan_rx = start_dir_scan(&mut app, path, &cancel_generation);
+                        if let Some((cached_entries, selected_index)) = app.navigation.back() {
+                            app.restore_cached_dir_entries(cached_entries, selected_index);
                         } else {
                             app.restore_root_entries();
                         }

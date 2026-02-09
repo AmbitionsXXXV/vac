@@ -11,8 +11,32 @@
 - `cargo build --release` builds the optimized binary.
 - `./target/release/vac` runs the release build.
 - `cargo run` builds and runs a dev build.
-- `cargo test` runs unit tests in `src/*`.
+- `cargo nextest run` runs unit tests in `src/*`（基于 cargo-nextest v0.9.122 测试运行器）.
+- `cargo nextest run -E 'test(test_name)'` runs a specific test by name.
+- `cargo nextest list` lists all available tests without running them.
 - `cargo fmt --all` formats code using `rustfmt.toml`.
+
+### cargo-nextest 安装
+
+macOS 预构建二进制安装（推荐）:
+
+- `curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin`
+
+或通过 Homebrew:
+
+- `brew install cargo-nextest`
+
+或通过源码安装:
+
+- `cargo install --locked cargo-nextest`
+
+### nextest 配置
+
+项目级配置文件位于 `.config/nextest.toml`，支持多 profile 机制:
+
+- 默认使用 `default` profile 运行测试。
+- CI 环境推荐使用 `--profile ci` 以禁用 fail-fast 行为。
+- 单个配置项可通过命令行参数、环境变量或配置文件覆盖。
 
 ## Coding Style & Naming Conventions
 - Rust 2024 edition, 4-space indentation, and `max_width = 100` (see `rustfmt.toml`).
