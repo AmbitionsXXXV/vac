@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::utils::expand_tilde;
+
 /// 应用配置
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AppConfig {
@@ -68,22 +70,11 @@ impl AppConfig {
 
     /// 获取展开后的额外扫描目标路径（~ 展开为主目录，过滤不存在的路径）
     pub fn expanded_extra_targets(&self) -> Vec<PathBuf> {
-        let home_dir = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-
         self.scan
             .extra_targets
             .iter()
             .filter_map(|raw_path| {
-                let expanded = if raw_path.starts_with('~') {
-                    if let Some(ref home) = home_dir {
-                        let home_str = home.display().to_string();
-                        PathBuf::from(raw_path.replacen('~', &home_str, 1))
-                    } else {
-                        PathBuf::from(raw_path)
-                    }
-                } else {
-                    PathBuf::from(raw_path)
-                };
+                let expanded = PathBuf::from(expand_tilde(raw_path));
                 if expanded.exists() {
                     Some(expanded)
                 } else {
