@@ -1,6 +1,6 @@
 [package]
 name = "vac"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A Mac disk cleanup CLI tool with TUI interface"
 license = "MIT"

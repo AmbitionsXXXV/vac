@@ -2,6 +2,40 @@
 
 All notable changes to VAC will be documented in this file.
 
+## [0.5.0] - 2026-02-10
+
+### ♻️ Refactoring
+
+- Introduce `utils.rs` module for shared functions across the codebase
+
+- Add `expand_tilde(path)` for unified `~` home directory expansion, replacing duplicated logic in `app.rs`, `cli.rs`, `config.rs`, and `main.rs`
+- Add `format_time(time, include_time)` for consistent `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS` formatting, replacing the previous `ui.rs`-local implementation
+- Define shared time constants: `SECONDS_PER_DAY`, `EPOCH_YEAR`
+
+- Extract `sort_entries_by(entries, order)` as a public standalone function in `app.rs` for reuse in both TUI and CLI sorting paths
+
+- Consolidate forbidden paths in `cleaner.rs` into a module-level `FORBIDDEN_PATHS` constant, shared between runtime checks and tests
+
+- Extract scanner helper functions for improved readability
+
+- `add_target_if_exists()`: unified conditional target appending
+- `is_cancelled()`: unified cancellation generation check
+
+- Extract UI helper functions in `ui.rs`
+
+- `styled_block()`: reusable styled block builder
+- `help_line()`: reusable help text line builder
+- `path_short_name()`: reusable path shortening utility
+
+### 🧪 Testing
+
+- Add unit tests for `utils.rs`: `format_time` date-only and date-time formatting, `expand_tilde` plain path passthrough
+
+### 📚 Documentation
+
+- Update architecture documentation to include `utils.rs` module description, purpose, and cross-module usage
+- Document `sort_entries_by()`, `FORBIDDEN_PATHS`, scanner helpers, and UI helper functions in architecture guide
+
 ## [0.4.0] - 2026-02-09
 
 ### ✨ Features
