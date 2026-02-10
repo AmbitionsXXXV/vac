@@ -20,7 +20,8 @@ vac/
     ├── config.rs       # 配置文件加载与解析
     ├── ui.rs           # UI 渲染
     ├── scanner.rs      # 磁盘扫描器
-    └── cleaner.rs      # 文件清理器
+    ├── cleaner.rs      # 文件清理器
+    └── utils.rs        # 共享工具函数（时间格式化、路径展开）
 ```
 
 ## 模块说明
@@ -53,6 +54,18 @@ vac/
 - `AppConfig::expanded_extra_targets()`: 展开 `~` 并过滤不存在的路径
 
 使用 `serde` + `toml` crate 进行反序列化，所有字段均有 `#[serde(default)]` 标注以支持部分配置。
+
+### utils.rs - 共享工具
+
+跨模块复用的公共函数与常量：
+
+- `expand_tilde(path)`: 统一将 `~` 展开为主目录绝对路径
+- `format_time(time, include_time)`: 统一时间格式化
+  - `include_time = false` 输出 `YYYY-MM-DD`
+  - `include_time = true` 输出 `YYYY-MM-DD HH:MM:SS`
+- 时间计算常量：`SECONDS_PER_DAY`、`EPOCH_YEAR`
+
+`app.rs`、`cli.rs`、`config.rs`、`main.rs`、`ui.rs` 均通过该模块复用路径与时间逻辑，避免重复实现。
 
 ### app.rs - 应用状态管理
 
@@ -88,6 +101,7 @@ vac/
 
 排序方法：
 
+- `sort_entries_by(entries, order)`: 通用排序函数（按名称/大小/时间）
 - `sort_root_entries()`: 根层条目排序，支持 ByName / BySize / ByTime 三种方式
 - `sort_dir_entries()`: 目录条目排序，支持三种方式
 - `toggle_sort_order()`: 循环切换排序方式（名称 → 大小 → 时间 → 名称），自动区分根目录和子目录场景
@@ -111,6 +125,9 @@ vac/
 - `reset_tab_completions()`: 清空补全状态（`tab_completions` 和 `tab_completion_index`）
 - `expand_input_tilde()`: 将路径中的 `~` 展开为主目录绝对路径
 - `build_tab_completions()`: 内部方法，读取文件系统构建候选列表，只匹配目录，保留 `~` 前缀显示
+  - `parse_path_input()`: 解析父目录和补全前缀
+  - `read_matching_dirs()`: 读取并过滤匹配目录
+  - `build_completion_display_path()`: 生成最终显示路径
 
 统计方法：
 
@@ -134,7 +151,8 @@ vac/
 - `render_input_popup()`: 路径输入弹窗（含 Tab 补全候选列表高亮显示，最多展示 5 个候选项）
 - `render_search_bar()`: 搜索栏
 - `render_error_popup()`: 错误弹窗（仅 Enter/Esc 可关闭）
-- `format_time()`: 将 SystemTime 格式化为 YYYY-MM-DD 字符串
+- `styled_block()` / `help_line()` / `path_short_name()`: 通用 UI 复用辅助函数
+- 时间显示统一复用 `utils::format_time()`
 
 ### scanner.rs - 磁盘扫描器
 
@@ -153,6 +171,11 @@ vac/
 扫描时会读取文件/目录的最后修改时间（`metadata.modified()`），支持按时间排序。
 
 异步扫描通过 `mpsc::channel` 发送进度消息。目录大小计算使用 **rayon** 并行处理，显著提升多目录场景的扫描速度。所有 `WalkDir` 遍历均设置 `follow_links(false)` 避免符号链接循环。
+
+实现中包含两个去重辅助函数：
+
+- `add_target_if_exists()`: 统一处理条件目标追加
+- `is_cancelled()`: 统一处理取消代次检查
 
 消息类型：
 
@@ -186,6 +209,8 @@ Dry-run 支持：
 - 对文件：直接移至回收站
 - 使用 `trash` crate 调用系统原生回收站 API
 
+清理循环通过 `process_items()` 统一，`clean()` 与 `trash_items()` 只保留策略差异。安全检查中的禁止路径列表由模块级常量 `FORBIDDEN_PATHS` 统一维护，并被测试复用。
+
 ### main.rs - 事件循环与 CLI 入口
 
 - 启动时使用 `clap` 解析 CLI 参数
@@ -196,6 +221,8 @@ Dry-run 支持：
 - 支持 Ctrl+d/u 等组合键通过 `KeyModifiers` 判断
 - 分离了各模式（Normal、Confirm、InputPath、Search、Scanning、Help、Stats）的键盘处理逻辑
 - `execute_clean()` 根据 `config.safety.move_to_trash` 选择 trash 或永久删除
+- `spawn_scan_thread()` 统一封装扫描线程启动流程
+- 非交互模式排序复用 `app::sort_entries_by()`，时间格式化复用 `utils::format_time()`
 
 ## 技术栈
 

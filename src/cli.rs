@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::utils::expand_tilde;
+
 /// VAC - macOS 磁盘清理工具
 ///
 /// 无参数启动时进入 TUI 交互界面；使用 --scan 等参数可以非交互模式运行。
@@ -52,16 +54,7 @@ impl std::str::FromStr for ScanTarget {
             "preset" => Ok(ScanTarget::Preset),
             "home" => Ok(ScanTarget::Home),
             other => {
-                let path = if other.starts_with('~') {
-                    if let Some(home) = directories::UserDirs::new() {
-                        let home_str = home.home_dir().display().to_string();
-                        PathBuf::from(other.replacen('~', &home_str, 1))
-                    } else {
-                        PathBuf::from(other)
-                    }
-                } else {
-                    PathBuf::from(other)
-                };
+                let path = PathBuf::from(expand_tilde(other));
                 Ok(ScanTarget::Path(path))
             }
         }

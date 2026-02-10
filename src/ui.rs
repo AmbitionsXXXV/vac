@@ -10,10 +10,22 @@ use ratatui::{
 };
 
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use crate::app::{App, EntryKind, Mode, SortOrder};
 use crate::scanner::format_size;
+use crate::utils::format_time;
+
+const DEFAULT_POPUP_WIDTH_PERCENT: u16 = 70;
+const DEFAULT_POPUP_HEIGHT_PERCENT: u16 = 80;
+const CONFIRM_POPUP_WIDTH_PERCENT: u16 = 60;
+const CONFIRM_POPUP_HEIGHT_PERCENT: u16 = 60;
+const STATS_POPUP_WIDTH_PERCENT: u16 = 70;
+const STATS_POPUP_HEIGHT_PERCENT: u16 = 70;
+const ERROR_POPUP_WIDTH_PERCENT: u16 = 60;
+const ERROR_POPUP_HEIGHT_PERCENT: u16 = 20;
+const MAX_VISIBLE_COMPLETIONS: usize = 5;
+const STATS_BAR_WIDTH: usize = 20;
+const POPUP_LIST_RESERVED_LINES: u16 = 11;
 
 /// UI 颜色主题
 pub struct Theme {
@@ -44,6 +56,35 @@ impl Default for Theme {
             bg_highlight: Color::DarkGray,
         }
     }
+}
+
+fn styled_block<'a>(
+    title: Option<&'a str>,
+    border_type: BorderType,
+    border_color: Color,
+) -> Block<'a> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(Style::default().fg(border_color));
+    if let Some(title_text) = title {
+        block.title(title_text)
+    } else {
+        block
+    }
+}
+
+fn help_line<'a>(key: &'a str, description: &'a str, theme: &Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(key, Style::default().fg(theme.accent)),
+        Span::raw(description),
+    ])
+}
+
+fn path_short_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// 渲染整个 UI
@@ -95,10 +136,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let header = Paragraph::new(Line::from(title))
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.primary))
+            styled_block(None, BorderType::Rounded, theme.primary)
                 .title_bottom(Line::from(stats).right_aligned()),
         )
         .alignment(Alignment::Center);
@@ -131,13 +169,11 @@ fn render_scanning(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     .areas(center);
 
     let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .title(" 扫描中... ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.primary)),
-        )
+        .block(styled_block(
+            Some(" 扫描中... "),
+            BorderType::Rounded,
+            theme.primary,
+        ))
         .gauge_style(Style::default().fg(theme.accent).bg(theme.bg_highlight))
         .percent(app.scan_progress as u16)
         .label(format!(
@@ -200,13 +236,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 )),
             ]
         };
-        let empty_text = Paragraph::new(content).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.secondary))
-                .title(" 可清理项目 "),
-        );
+        let empty_text = Paragraph::new(content)
+            .alignment(Alignment::Center)
+            .block(styled_block(
+                Some(" 可清理项目 "),
+                BorderType::Rounded,
+                theme.secondary,
+            ));
         frame.render_widget(empty_text, area);
         return;
     }
@@ -228,7 +264,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             let time_str = entry
                 .modified_at
                 .as_ref()
-                .map(format_time)
+                .map(|time| format_time(time, false))
                 .unwrap_or_default();
             let mut spans = vec![
                 Span::styled(
@@ -254,11 +290,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 
     let list = List::new(items)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.secondary))
-                .title(" 可清理项目 ")
+            styled_block(Some(" 可清理项目 "), BorderType::Rounded, theme.secondary)
                 .padding(Padding::horizontal(1)),
         )
         .highlight_style(
@@ -324,19 +356,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let footer = Paragraph::new(help_text)
         .style(Style::default().fg(theme.text_dim))
         .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.secondary)),
-        );
+        .block(styled_block(None, BorderType::Rounded, theme.secondary));
 
     frame.render_widget(footer, area);
 }
 
 /// 渲染帮助弹窗
 fn render_help_popup(frame: &mut Frame, theme: &Theme) {
-    let area = centered_rect(70, 80, frame.area());
+    let area = centered_rect(
+        DEFAULT_POPUP_WIDTH_PERCENT,
+        DEFAULT_POPUP_HEIGHT_PERCENT,
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     let help_content = vec![
@@ -349,97 +380,40 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
             "扫描操作",
             Style::default().fg(theme.secondary).bold(),
         )),
-        Line::from(vec![
-            Span::styled("  s          ", Style::default().fg(theme.accent)),
-            Span::raw("扫描预设可清理目录"),
-        ]),
-        Line::from(vec![
-            Span::styled("  S          ", Style::default().fg(theme.accent)),
-            Span::raw("扫描用户主目录"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d          ", Style::default().fg(theme.accent)),
-            Span::raw("输入自定义路径扫描"),
-        ]),
+        help_line("  s          ", "扫描预设可清理目录", theme),
+        help_line("  S          ", "扫描用户主目录", theme),
+        help_line("  d          ", "输入自定义路径扫描", theme),
         Line::from(""),
         Line::from(Span::styled(
             "浏览与排序",
             Style::default().fg(theme.secondary).bold(),
         )),
-        Line::from(vec![
-            Span::styled("  Enter      ", Style::default().fg(theme.accent)),
-            Span::raw("进入目录"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Backspace  ", Style::default().fg(theme.accent)),
-            Span::raw("返回上一级"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc        ", Style::default().fg(theme.accent)),
-            Span::raw("返回上一级/取消扫描"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ↑/k        ", Style::default().fg(theme.accent)),
-            Span::raw("向上移动"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ↓/j        ", Style::default().fg(theme.accent)),
-            Span::raw("向下移动"),
-        ]),
-        Line::from(vec![
-            Span::styled("  g/G        ", Style::default().fg(theme.accent)),
-            Span::raw("跳到顶部/底部"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Ctrl+d/u   ", Style::default().fg(theme.accent)),
-            Span::raw("向下/上翻半页"),
-        ]),
-        Line::from(vec![
-            Span::styled("  PgDn/PgUp  ", Style::default().fg(theme.accent)),
-            Span::raw("向下/上翻半页"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /          ", Style::default().fg(theme.accent)),
-            Span::raw("搜索/过滤列表"),
-        ]),
-        Line::from(vec![
-            Span::styled("  o          ", Style::default().fg(theme.accent)),
-            Span::raw("切换排序方式 (名称/大小/时间)"),
-        ]),
+        help_line("  Enter      ", "进入目录", theme),
+        help_line("  Backspace  ", "返回上一级", theme),
+        help_line("  Esc        ", "返回上一级/取消扫描", theme),
+        help_line("  ↑/k        ", "向上移动", theme),
+        help_line("  ↓/j        ", "向下移动", theme),
+        help_line("  g/G        ", "跳到顶部/底部", theme),
+        help_line("  Ctrl+d/u   ", "向下/上翻半页", theme),
+        help_line("  PgDn/PgUp  ", "向下/上翻半页", theme),
+        help_line("  /          ", "搜索/过滤列表", theme),
+        help_line("  o          ", "切换排序方式 (名称/大小/时间)", theme),
         Line::from(""),
         Line::from(Span::styled(
             "选择与清理",
             Style::default().fg(theme.secondary).bold(),
         )),
-        Line::from(vec![
-            Span::styled("  Space      ", Style::default().fg(theme.accent)),
-            Span::raw("选择/取消选择当前项"),
-        ]),
-        Line::from(vec![
-            Span::styled("  a          ", Style::default().fg(theme.accent)),
-            Span::raw("全选/取消全选"),
-        ]),
-        Line::from(vec![
-            Span::styled("  c          ", Style::default().fg(theme.accent)),
-            Span::raw("执行清理"),
-        ]),
+        help_line("  Space      ", "选择/取消选择当前项", theme),
+        help_line("  a          ", "全选/取消全选", theme),
+        help_line("  c          ", "执行清理", theme),
         Line::from(""),
         Line::from(Span::styled(
             "其他",
             Style::default().fg(theme.secondary).bold(),
         )),
-        Line::from(vec![
-            Span::styled("  t          ", Style::default().fg(theme.accent)),
-            Span::raw("空间占用统计"),
-        ]),
-        Line::from(vec![
-            Span::styled("  ?          ", Style::default().fg(theme.accent)),
-            Span::raw("显示/隐藏帮助"),
-        ]),
-        Line::from(vec![
-            Span::styled("  q          ", Style::default().fg(theme.accent)),
-            Span::raw("退出程序"),
-        ]),
+        help_line("  t          ", "空间占用统计", theme),
+        help_line("  ?          ", "显示/隐藏帮助", theme),
+        help_line("  q          ", "退出程序", theme),
         Line::from(""),
         Line::from(Span::styled(
             "注意: 清理操作不可逆，请谨慎操作！",
@@ -449,11 +423,7 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
 
     let help = Paragraph::new(help_content)
         .block(
-            Block::default()
-                .title(" 帮助 ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(Style::default().fg(theme.primary))
+            styled_block(Some(" 帮助 "), BorderType::Double, theme.primary)
                 .padding(Padding::uniform(1)),
         )
         .wrap(Wrap { trim: true });
@@ -464,20 +434,28 @@ fn render_help_popup(frame: &mut Frame, theme: &Theme) {
 /// 渲染路径输入弹窗
 fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     // 动态计算弹窗高度：基础行数 + 候选列表行数
-    let max_visible_completions = 5;
-    let completion_count = app.tab_completions.len().min(max_visible_completions);
+    let completion_count = app.tab_completions.len().min(MAX_VISIBLE_COMPLETIONS);
     let has_completions = !app.tab_completions.is_empty();
     // 基础: 标题(1) + 空行(1) + 提示(1) + 空行(1) + 输入行(1) + 空行(1) + 操作提示(1)
     //       + padding(2) + border(2) = 12 行
     // 候选列表: 空行(1) + 候选项(N) + 可能的省略提示(1)
     let extra_lines = if has_completions {
-        1 + completion_count + if app.tab_completions.len() > max_visible_completions { 1 } else { 0 }
+        1 + completion_count
+            + if app.tab_completions.len() > MAX_VISIBLE_COMPLETIONS {
+                1
+            } else {
+                0
+            }
     } else {
         0
     };
     let popup_height = (12 + extra_lines) as u16;
     let percent_y = ((popup_height as u32) * 100 / frame.area().height as u32).max(20) as u16;
-    let area = centered_rect(60, percent_y.min(80), frame.area());
+    let area = centered_rect(
+        60,
+        percent_y.min(DEFAULT_POPUP_HEIGHT_PERCENT),
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     let input_display = if app.input_buffer.is_empty() {
@@ -508,7 +486,11 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     if has_completions {
         content.push(Line::from(""));
         let current_index = app.tab_completion_index.unwrap_or(0);
-        for (i, completion) in app.tab_completions.iter().enumerate().take(max_visible_completions)
+        for (i, completion) in app
+            .tab_completions
+            .iter()
+            .enumerate()
+            .take(MAX_VISIBLE_COMPLETIONS)
         {
             let is_selected = i == current_index;
             if is_selected {
@@ -526,7 +508,7 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
                 ]));
             }
         }
-        if app.tab_completions.len() > max_visible_completions {
+        if app.tab_completions.len() > MAX_VISIBLE_COMPLETIONS {
             content.push(Line::from(Span::styled(
                 format!("    ... 共 {} 项", app.tab_completions.len()),
                 Style::default().fg(theme.text_dim),
@@ -546,11 +528,7 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let input_box = Paragraph::new(content)
         .block(
-            Block::default()
-                .title(" 输入路径 ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(Style::default().fg(theme.primary))
+            styled_block(Some(" 输入路径 "), BorderType::Double, theme.primary)
                 .padding(Padding::uniform(1)),
         )
         .alignment(Alignment::Center);
@@ -560,7 +538,11 @@ fn render_input_popup(frame: &mut Frame, app: &App, theme: &Theme) {
 
 /// 渲染确认删除弹窗（可滚动预览列表）
 fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
-    let area = centered_rect(60, 60, frame.area());
+    let area = centered_rect(
+        CONFIRM_POPUP_WIDTH_PERCENT,
+        CONFIRM_POPUP_HEIGHT_PERCENT,
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     if app.dry_run_active {
@@ -599,16 +581,13 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     ];
 
     // 可视列表区高度 = popup 总高 - 边框(2) - padding(2) - 头(4) - 尾(3)
-    let visible_height = area.height.saturating_sub(11) as usize;
+    let visible_height = area.height.saturating_sub(POPUP_LIST_RESERVED_LINES) as usize;
     let scroll = app
         .confirm_scroll
         .min(items.len().saturating_sub(visible_height));
 
     for (path, size) in items.iter().skip(scroll).take(visible_height) {
-        let name: String = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
+        let name = path_short_name(path);
         lines.push(Line::from(vec![
             Span::styled("  • ", Style::default().fg(theme.text_dim)),
             Span::styled(name, Style::default().fg(theme.text)),
@@ -653,13 +632,8 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, theme: &Theme) {
         Span::raw(" 滚动"),
     ]));
 
-    let confirm = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .border_style(Style::default().fg(theme.warning))
-            .padding(Padding::uniform(1)),
-    );
+    let confirm = Paragraph::new(lines)
+        .block(styled_block(None, BorderType::Double, theme.warning).padding(Padding::uniform(1)));
 
     frame.render_widget(confirm, area);
 }
@@ -694,17 +668,13 @@ fn render_dry_run_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         ]));
         lines.push(Line::from(""));
 
-        let visible_height = area.height.saturating_sub(11) as usize;
+        let visible_height = area.height.saturating_sub(POPUP_LIST_RESERVED_LINES) as usize;
         let scroll = app
             .confirm_scroll
             .min(result.items.len().saturating_sub(visible_height));
 
         for item in result.items.iter().skip(scroll).take(visible_height) {
-            let name: String = item
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| item.path.display().to_string());
+            let name = path_short_name(&item.path);
             lines.push(Line::from(vec![
                 Span::styled("  • ", Style::default().fg(theme.text_dim)),
                 Span::styled(name, Style::default().fg(theme.text)),
@@ -743,13 +713,8 @@ fn render_dry_run_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         Span::raw(" 取消"),
     ]));
 
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .border_style(Style::default().fg(theme.primary))
-            .padding(Padding::uniform(1)),
-    );
+    let popup = Paragraph::new(lines)
+        .block(styled_block(None, BorderType::Double, theme.primary).padding(Padding::uniform(1)));
 
     frame.render_widget(popup, area);
 }
@@ -757,7 +722,11 @@ fn render_dry_run_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
 /// 渲染错误弹窗
 fn render_error_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     if let Some(ref msg) = app.error_message {
-        let area = centered_rect(60, 20, frame.area());
+        let area = centered_rect(
+            ERROR_POPUP_WIDTH_PERCENT,
+            ERROR_POPUP_HEIGHT_PERCENT,
+            frame.area(),
+        );
         frame.render_widget(Clear, area);
 
         let content = vec![
@@ -773,11 +742,7 @@ fn render_error_popup(frame: &mut Frame, app: &App, theme: &Theme) {
 
         let error = Paragraph::new(content)
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
-                    .border_style(Style::default().fg(theme.danger))
-                    .padding(Padding::uniform(1)),
+                styled_block(None, BorderType::Double, theme.danger).padding(Padding::uniform(1)),
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
@@ -788,7 +753,11 @@ fn render_error_popup(frame: &mut Frame, app: &App, theme: &Theme) {
 
 /// 渲染统计面板弹窗
 fn render_stats_popup(frame: &mut Frame, app: &App, theme: &Theme) {
-    let area = centered_rect(70, 70, frame.area());
+    let area = centered_rect(
+        STATS_POPUP_WIDTH_PERCENT,
+        STATS_POPUP_HEIGHT_PERCENT,
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     let stats = app.get_category_stats();
@@ -802,17 +771,14 @@ fn render_stats_popup(frame: &mut Frame, app: &App, theme: &Theme) {
         Line::from(""),
     ];
 
-    // 进度条宽度（字符数）
-    let bar_width = 20usize;
-
     for (category_name, size) in &stats {
         let percent = if total_size > 0 {
             (*size as f64 / total_size as f64 * 100.0) as u16
         } else {
             0
         };
-        let filled = (percent as usize * bar_width / 100).min(bar_width);
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+        let filled = (percent as usize * STATS_BAR_WIDTH / 100).min(STATS_BAR_WIDTH);
+        let bar: String = "█".repeat(filled) + &"░".repeat(STATS_BAR_WIDTH - filled);
 
         // 分类名固定宽度对齐
         let padded_name = format!("{:<14}", category_name);
@@ -848,11 +814,7 @@ fn render_stats_popup(frame: &mut Frame, app: &App, theme: &Theme) {
     )));
 
     let popup = Paragraph::new(lines).block(
-        Block::default()
-            .title(" 统计 ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .border_style(Style::default().fg(theme.primary))
+        styled_block(Some(" 统计 "), BorderType::Double, theme.primary)
             .padding(Padding::uniform(1)),
     );
 
@@ -883,69 +845,13 @@ fn render_search_bar(frame: &mut Frame, app: &App, theme: &Theme) {
         Span::styled("█", Style::default().fg(theme.accent)),
     ]);
 
-    let bar = Paragraph::new(content).block(
-        Block::default()
-            .title(" 搜索 ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent)),
-    );
+    let bar = Paragraph::new(content).block(styled_block(
+        Some(" 搜索 "),
+        BorderType::Rounded,
+        theme.accent,
+    ));
 
     frame.render_widget(bar, bar_area);
-}
-
-/// 格式化 SystemTime 为 "YYYY-MM-DD" 字符串
-fn format_time(time: &SystemTime) -> String {
-    let duration = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs() as i64;
-
-    // 简单日期计算（不引入额外依赖）
-    let days = secs / 86400;
-    let mut remaining_days = days;
-    let mut year = 1970i32;
-
-    loop {
-        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            366
-        } else {
-            365
-        };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_months: [i64; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-
-    let mut month = 0usize;
-    for (i, &dim) in days_in_months.iter().enumerate() {
-        if remaining_days < dim {
-            month = i;
-            break;
-        }
-        remaining_days -= dim;
-    }
-
-    let day = remaining_days + 1;
-    format!("{:04}-{:02}-{:02}", year, month + 1, day)
 }
 
 /// 计算居中矩形区域

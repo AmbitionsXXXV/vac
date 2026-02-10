@@ -1,4 +1,5 @@
 use ratatui::widgets::ListState;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -6,6 +7,11 @@ use std::time::SystemTime;
 use crate::cleaner::DryRunResult;
 use crate::config::AppConfig;
 use crate::scanner::ScanKind;
+use crate::utils::expand_tilde;
+
+const DEFAULT_VISIBLE_HEIGHT: usize = 20;
+const MIN_PAGE_SCROLL: usize = 1;
+const SCAN_PROGRESS_COMPLETE: u8 = 100;
 
 /// 应用运行模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +283,33 @@ pub struct App {
     pub tab_completion_index: Option<usize>,
 }
 
+pub fn sort_entries_by(entries: &mut [CleanableEntry], sort_order: SortOrder) {
+    match sort_order {
+        SortOrder::ByName => {
+            entries.sort_by(
+                |left_entry, right_entry| match (left_entry.kind, right_entry.kind) {
+                    (EntryKind::Directory, EntryKind::File) => Ordering::Less,
+                    (EntryKind::File, EntryKind::Directory) => Ordering::Greater,
+                    _ => left_entry.name.cmp(&right_entry.name),
+                },
+            );
+        }
+        SortOrder::BySize => {
+            entries.sort_by(|left_entry, right_entry| {
+                right_entry
+                    .size
+                    .unwrap_or(0)
+                    .cmp(&left_entry.size.unwrap_or(0))
+            });
+        }
+        SortOrder::ByTime => {
+            entries.sort_by(|left_entry, right_entry| {
+                right_entry.modified_at.cmp(&left_entry.modified_at)
+            });
+        }
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -317,7 +350,7 @@ impl App {
             scan_in_progress: false,
             sort_order,
             input_buffer: String::new(),
-            visible_height: 20,
+            visible_height: DEFAULT_VISIBLE_HEIGHT,
             last_clean_result: None,
             confirm_scroll: 0,
             search_query: String::new(),
@@ -332,32 +365,30 @@ impl App {
 
     /// 选择下一项
     pub fn next(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let i = match self.list_state.selected() {
-            Some(i) => (i + 1) % self.entries.len(),
-            None => 0,
-        };
-        self.list_state.select(Some(i));
+        self.move_selection(true);
     }
 
     /// 选择上一项
     pub fn previous(&mut self) {
+        self.move_selection(false);
+    }
+
+    fn move_selection(&mut self, move_forward: bool) {
         if self.entries.is_empty() {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
+        let next_index = match self.list_state.selected() {
+            Some(current_index) if move_forward => (current_index + 1) % self.entries.len(),
+            Some(current_index) => {
+                if current_index == 0 {
                     self.entries.len() - 1
                 } else {
-                    i - 1
+                    current_index - 1
                 }
             }
             None => 0,
         };
-        self.list_state.select(Some(i));
+        self.list_state.select(Some(next_index));
     }
 
     /// 跳到列表第一项
@@ -379,7 +410,7 @@ impl App {
         if self.entries.is_empty() {
             return;
         }
-        let half_page = (visible_height / 2).max(1);
+        let half_page = (visible_height / 2).max(MIN_PAGE_SCROLL);
         let current = self.list_state.selected().unwrap_or(0);
         let target = (current + half_page).min(self.entries.len() - 1);
         self.list_state.select(Some(target));
@@ -390,7 +421,7 @@ impl App {
         if self.entries.is_empty() {
             return;
         }
-        let half_page = (visible_height / 2).max(1);
+        let half_page = (visible_height / 2).max(MIN_PAGE_SCROLL);
         let current = self.list_state.selected().unwrap_or(0);
         let target = current.saturating_sub(half_page);
         self.list_state.select(Some(target));
@@ -417,26 +448,40 @@ impl App {
             .entries
             .iter()
             .all(|entry| self.selections.contains_key(&entry.path));
-        // 收集路径和元数据，避免 clone 整个 entries
-        let info: Vec<_> = self
+        let entry_summaries: Vec<_> = self
             .entries
             .iter()
             .map(|e| (e.path.clone(), e.kind, e.size))
             .collect();
-        for (path, kind, size) in info {
-            if !all_selected {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    self.selections.entry(path)
-                {
-                    entry.insert(SelectedEntry { kind, size });
-                    if let Some(s) = size {
-                        self.selected_size += s;
-                    }
-                }
-            } else if let Some(prev) = self.selections.remove(&path)
-                && let Some(s) = prev.size
+        if all_selected {
+            self.deselect_all_entries(&entry_summaries);
+        } else {
+            self.select_all_entries(&entry_summaries);
+        }
+    }
+
+    fn select_all_entries(&mut self, entry_summaries: &[(PathBuf, EntryKind, Option<u64>)]) {
+        for (path, kind, size) in entry_summaries {
+            if let std::collections::hash_map::Entry::Vacant(selection_entry) =
+                self.selections.entry(path.clone())
             {
-                self.selected_size = self.selected_size.saturating_sub(s);
+                selection_entry.insert(SelectedEntry {
+                    kind: *kind,
+                    size: *size,
+                });
+                if let Some(item_size) = *size {
+                    self.selected_size += item_size;
+                }
+            }
+        }
+    }
+
+    fn deselect_all_entries(&mut self, entry_summaries: &[(PathBuf, EntryKind, Option<u64>)]) {
+        for (path, _, _) in entry_summaries {
+            if let Some(previous_selection) = self.selections.remove(path)
+                && let Some(item_size) = previous_selection.size
+            {
+                self.selected_size = self.selected_size.saturating_sub(item_size);
             }
         }
     }
@@ -561,23 +606,7 @@ impl App {
 
     /// 根层条目排序
     pub fn sort_root_entries(&mut self) {
-        match self.sort_order {
-            SortOrder::ByName => {
-                self.root_entries.sort_by(|a, b| match (a.kind, b.kind) {
-                    (EntryKind::Directory, EntryKind::File) => std::cmp::Ordering::Less,
-                    (EntryKind::File, EntryKind::Directory) => std::cmp::Ordering::Greater,
-                    _ => a.name.cmp(&b.name),
-                });
-            }
-            SortOrder::BySize => {
-                self.root_entries
-                    .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
-            }
-            SortOrder::ByTime => {
-                self.root_entries
-                    .sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-            }
-        }
+        sort_entries_by(&mut self.root_entries, self.sort_order);
         if self.navigation.current_path.is_none() {
             self.set_entries(self.root_entries.clone());
         }
@@ -585,23 +614,7 @@ impl App {
 
     /// 目录条目排序
     pub fn sort_dir_entries(&mut self) {
-        match self.sort_order {
-            SortOrder::ByName => {
-                self.entries.sort_by(|a, b| match (a.kind, b.kind) {
-                    (EntryKind::Directory, EntryKind::File) => std::cmp::Ordering::Less,
-                    (EntryKind::File, EntryKind::Directory) => std::cmp::Ordering::Greater,
-                    _ => a.name.cmp(&b.name),
-                });
-            }
-            SortOrder::BySize => {
-                self.entries
-                    .sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
-            }
-            SortOrder::ByTime => {
-                self.entries
-                    .sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-            }
-        }
+        sort_entries_by(&mut self.entries, self.sort_order);
         if !self.entries.is_empty() {
             self.list_state.select(Some(0));
         }
@@ -687,7 +700,7 @@ impl App {
         if self.mode == Mode::Scanning {
             self.mode = Mode::Normal;
         }
-        self.scan_progress = 100;
+        self.scan_progress = SCAN_PROGRESS_COMPLETE;
     }
 
     /// 清除所有选中
@@ -770,17 +783,7 @@ impl App {
         if path.is_empty() {
             return None;
         }
-        // 展开 ~ 为用户主目录
-        let expanded = if path.starts_with('~') {
-            if let Some(home) = directories::UserDirs::new() {
-                let home_str = home.home_dir().display().to_string();
-                path.replacen('~', &home_str, 1)
-            } else {
-                path.to_string()
-            }
-        } else {
-            path.to_string()
-        };
+        let expanded = Self::expand_input_tilde(path);
         Some(PathBuf::from(expanded))
     }
 
@@ -793,13 +796,7 @@ impl App {
 
     /// 将路径中的 `~` 展开为主目录绝对路径
     fn expand_input_tilde(raw: &str) -> String {
-        if raw.starts_with('~') {
-            if let Some(home) = directories::UserDirs::new() {
-                let home_str = home.home_dir().display().to_string();
-                return raw.replacen('~', &home_str, 1);
-            }
-        }
-        raw.to_string()
+        expand_tilde(raw)
     }
 
     /// Tab 正向补全/循环
@@ -842,80 +839,92 @@ impl App {
             return;
         }
 
-        let expanded = Self::expand_input_tilde(raw_input);
-        let expanded_path = std::path::Path::new(&expanded);
-
-        // 分离 parent_dir 和 prefix
-        // 如果输入以 / 结尾，则 parent 是整个路径，prefix 为空
-        let (parent_dir, prefix) = if expanded.ends_with('/') {
-            (expanded.clone(), String::new())
-        } else if let Some(parent) = expanded_path.parent() {
-            let file_name = expanded_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (parent.display().to_string(), file_name)
-        } else {
+        let expanded_input = Self::expand_input_tilde(raw_input);
+        let Some((parent_dir, prefix)) = Self::parse_path_input(&expanded_input) else {
             return;
         };
 
-        // 确定原始输入中 ~ 对应的前缀部分，用于重建显示字符串
-        let uses_tilde = raw_input.starts_with('~');
-        let home_str = if uses_tilde {
-            directories::UserDirs::new().map(|h| h.home_dir().display().to_string())
+        let matching_directories = Self::read_matching_dirs(&parent_dir, &prefix);
+        if matching_directories.is_empty() {
+            return;
+        }
+
+        let home_directory = if raw_input.starts_with('~') {
+            directories::UserDirs::new().map(|dirs| dirs.home_dir().display().to_string())
         } else {
             None
         };
 
-        // 读取 parent_dir 中的目录条目
-        let read_dir = match std::fs::read_dir(&parent_dir) {
-            Ok(rd) => rd,
-            Err(_) => return,
+        let mut completions: Vec<String> = matching_directories
+            .into_iter()
+            .map(|expanded_path| {
+                Self::build_completion_display_path(expanded_path, home_directory.as_deref())
+            })
+            .collect();
+        completions.sort();
+        self.tab_completions = completions;
+        self.tab_completion_index = Some(0);
+        self.input_buffer = self.tab_completions[0].clone();
+    }
+
+    fn parse_path_input(expanded_input: &str) -> Option<(String, String)> {
+        let expanded_path = std::path::Path::new(expanded_input);
+        if expanded_input.ends_with('/') {
+            return Some((expanded_input.to_string(), String::new()));
+        }
+
+        let parent_directory = expanded_path.parent()?;
+        let file_name_prefix = expanded_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Some((parent_directory.display().to_string(), file_name_prefix))
+    }
+
+    fn read_matching_dirs(parent_dir: &str, prefix: &str) -> Vec<String> {
+        let read_dir = match std::fs::read_dir(parent_dir) {
+            Ok(read_dir) => read_dir,
+            Err(_) => return Vec::new(),
         };
 
-        let mut completions: Vec<String> = Vec::new();
-        let prefix_lower = prefix.to_lowercase();
+        let lowercase_prefix = prefix.to_lowercase();
+        let mut matched_directories = Vec::new();
 
-        for dir_entry in read_dir.flatten() {
-            let file_type = match dir_entry.file_type() {
-                Ok(ft) => ft,
+        for directory_entry in read_dir.flatten() {
+            let file_type = match directory_entry.file_type() {
+                Ok(file_type) => file_type,
                 Err(_) => continue,
             };
             if !file_type.is_dir() {
                 continue;
             }
-            let entry_name = dir_entry.file_name().to_string_lossy().to_string();
-            if !prefix.is_empty() && !entry_name.to_lowercase().starts_with(&prefix_lower) {
+
+            let entry_name = directory_entry.file_name().to_string_lossy().to_string();
+            if !prefix.is_empty() && !entry_name.to_lowercase().starts_with(&lowercase_prefix) {
                 continue;
             }
 
-            // 重建显示路径
-            let full_expanded = format!(
+            let expanded_path = format!(
                 "{}{}{}/",
                 parent_dir,
                 if parent_dir.ends_with('/') { "" } else { "/" },
                 entry_name
             );
-
-            // 如果原始输入使用了 ~，将主目录替换回 ~
-            let display_path = if let Some(ref home) = home_str {
-                full_expanded.replacen(home.as_str(), "~", 1)
-            } else {
-                full_expanded
-            };
-
-            completions.push(display_path);
+            matched_directories.push(expanded_path);
         }
 
-        completions.sort();
+        matched_directories
+    }
 
-        if completions.is_empty() {
-            return;
+    fn build_completion_display_path(
+        expanded_path: String,
+        home_directory: Option<&str>,
+    ) -> String {
+        if let Some(home_path) = home_directory {
+            expanded_path.replacen(home_path, "~", 1)
+        } else {
+            expanded_path
         }
-
-        self.tab_completions = completions;
-        self.tab_completion_index = Some(0);
-        self.input_buffer = self.tab_completions[0].clone();
     }
 
     /// 清空 Tab 补全状态

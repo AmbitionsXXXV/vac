@@ -8,6 +8,24 @@ use walkdir::WalkDir;
 
 use crate::app::{CleanableEntry, EntryKind, ItemCategory};
 
+const ROOT_PROGRESS_COMPLETE: f32 = 100.0;
+const DISK_PROGRESS_HALF: f32 = 50.0;
+const DISK_PROGRESS_STAGE_SIZE: u8 = 50;
+
+fn is_cancelled(cancel_generation: &AtomicU64, job_id: u64) -> bool {
+    cancel_generation.load(Ordering::Relaxed) != job_id
+}
+
+fn add_target_if_exists(
+    targets: &mut Vec<(ItemCategory, PathBuf)>,
+    category: ItemCategory,
+    target_path: PathBuf,
+) {
+    if target_path.exists() {
+        targets.push((category, target_path));
+    }
+}
+
 /// 扫描类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanKind {
@@ -100,54 +118,58 @@ impl Scanner {
         ];
 
         // Xcode 派生数据（条件添加）
-        let xcode_derived = self.home_dir.join("Library/Developer/Xcode/DerivedData");
-        if xcode_derived.exists() {
-            targets.push((ItemCategory::XcodeDerivedData, xcode_derived));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::XcodeDerivedData,
+            self.home_dir.join("Library/Developer/Xcode/DerivedData"),
+        );
 
         // Homebrew 缓存（条件添加）
-        let brew_cache = self.home_dir.join("Library/Caches/Homebrew");
-        if brew_cache.exists() {
-            targets.push((ItemCategory::HomebrewCache, brew_cache));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::HomebrewCache,
+            self.home_dir.join("Library/Caches/Homebrew"),
+        );
 
         // CocoaPods 缓存
-        let cocoapods_cache = self.home_dir.join("Library/Caches/CocoaPods");
-        if cocoapods_cache.exists() {
-            targets.push((ItemCategory::CocoaPods, cocoapods_cache));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::CocoaPods,
+            self.home_dir.join("Library/Caches/CocoaPods"),
+        );
 
         // npm 缓存
-        let npm_cache = self.home_dir.join(".npm/_cacache");
-        if npm_cache.exists() {
-            targets.push((ItemCategory::NpmCache, npm_cache));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::NpmCache,
+            self.home_dir.join(".npm/_cacache"),
+        );
 
         // pip 缓存
-        let pip_cache = self.home_dir.join("Library/Caches/pip");
-        if pip_cache.exists() {
-            targets.push((ItemCategory::PipCache, pip_cache));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::PipCache,
+            self.home_dir.join("Library/Caches/pip"),
+        );
 
         // Docker 数据
-        let docker_data = self
-            .home_dir
-            .join("Library/Containers/com.docker.docker/Data");
-        if docker_data.exists() {
-            targets.push((ItemCategory::DockerData, docker_data));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::DockerData,
+            self.home_dir
+                .join("Library/Containers/com.docker.docker/Data"),
+        );
 
         // Cargo 缓存
-        let cargo_cache = self.home_dir.join(".cargo/registry/cache");
-        if cargo_cache.exists() {
-            targets.push((ItemCategory::CargoCache, cargo_cache));
-        }
+        add_target_if_exists(
+            &mut targets,
+            ItemCategory::CargoCache,
+            self.home_dir.join(".cargo/registry/cache"),
+        );
 
         // 用户配置的额外扫描目标
         for extra_path in &self.extra_targets {
-            if extra_path.exists() {
-                targets.push((ItemCategory::Custom, extra_path.clone()));
-            }
+            add_target_if_exists(&mut targets, ItemCategory::Custom, extra_path.clone());
         }
 
         targets
@@ -185,7 +207,7 @@ impl Scanner {
         tx: Sender<ScanMessage>,
         cancel_gen: Arc<AtomicU64>,
     ) {
-        if cancel_gen.load(Ordering::Relaxed) != job_id {
+        if is_cancelled(&cancel_gen, job_id) {
             return;
         }
 
@@ -193,11 +215,11 @@ impl Scanner {
         let total = targets.len().max(1);
 
         for (index, (category, path)) in targets.into_iter().enumerate() {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
 
-            let progress = ((index as f32 / total as f32) * 100.0) as u8;
+            let progress = ((index as f32 / total as f32) * ROOT_PROGRESS_COMPLETE) as u8;
             let path_str = path.display().to_string();
             let _ = tx.send(ScanMessage::Progress {
                 job_id,
@@ -207,7 +229,7 @@ impl Scanner {
 
             if path.exists() {
                 let size = self.scan_directory_with_cancel(&path, job_id, &cancel_gen);
-                if cancel_gen.load(Ordering::Relaxed) != job_id {
+                if is_cancelled(&cancel_gen, job_id) {
                     return;
                 }
                 if size > 0 {
@@ -237,7 +259,7 @@ impl Scanner {
         tx: Sender<ScanMessage>,
         cancel_gen: Arc<AtomicU64>,
     ) {
-        if cancel_gen.load(Ordering::Relaxed) != job_id {
+        if is_cancelled(&cancel_gen, job_id) {
             return;
         }
 
@@ -255,7 +277,7 @@ impl Scanner {
         let mut dir_paths = Vec::new();
 
         for entry in read_dir {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
 
@@ -302,11 +324,11 @@ impl Scanner {
 
         // 并行计算目录大小
         dir_paths.par_iter().for_each(|dir_path| {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
             let size = calc_dir_size(dir_path, job_id, &cancel_gen);
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
             let _ = tx.send(ScanMessage::DirEntrySize {
@@ -327,7 +349,7 @@ impl Scanner {
         tx: Sender<ScanMessage>,
         cancel_gen: Arc<AtomicU64>,
     ) {
-        if cancel_gen.load(Ordering::Relaxed) != job_id {
+        if is_cancelled(&cancel_gen, job_id) {
             return;
         }
 
@@ -370,11 +392,11 @@ impl Scanner {
         let mut dir_paths = Vec::new();
 
         for (index, entry) in entries.into_iter().enumerate() {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
 
-            let progress = ((index as f32 / total as f32) * 50.0) as u8;
+            let progress = ((index as f32 / total as f32) * DISK_PROGRESS_HALF) as u8;
             let entry_path = entry.path();
             let _ = tx.send(ScanMessage::Progress {
                 job_id,
@@ -420,15 +442,15 @@ impl Scanner {
         // 并行计算目录大小
         let _ = tx.send(ScanMessage::Progress {
             job_id,
-            progress: 50,
+            progress: DISK_PROGRESS_STAGE_SIZE,
             path: "并行计算目录大小...".to_string(),
         });
         dir_paths.par_iter().for_each(|dir_path| {
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
             let size = calc_dir_size(dir_path, job_id, &cancel_gen);
-            if cancel_gen.load(Ordering::Relaxed) != job_id {
+            if is_cancelled(&cancel_gen, job_id) {
                 return;
             }
             let _ = tx.send(ScanMessage::DirEntrySize {
@@ -467,7 +489,7 @@ fn calc_dir_size(path: &PathBuf, job_id: u64, cancel_gen: &AtomicU64) -> u64 {
 
     let mut total = 0u64;
     for entry in WalkDir::new(path).follow_links(false).into_iter() {
-        if cancel_gen.load(Ordering::Relaxed) != job_id {
+        if is_cancelled(cancel_gen, job_id) {
             return total;
         }
         let entry = match entry {

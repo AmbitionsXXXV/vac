@@ -34,19 +34,61 @@ pub struct DryRunResult {
 /// 磁盘清理器
 pub struct Cleaner;
 
+const FORBIDDEN_PATHS: &[&str] = &[
+    "/",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/Users",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/var",
+    "/etc",
+    "/private",
+];
+
 impl Cleaner {
     /// 清理选中的项目（永久删除）
     pub fn clean(items: &[CleanableEntry]) -> CleanResult {
+        Self::process_items(items, |item| {
+            Self::remove_path(&item.path).map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+    }
+
+    /// 将选中的项目移至系统回收站
+    pub fn trash_items(items: &[CleanableEntry]) -> CleanResult {
+        Self::process_items(items, |item| {
+            if !item.path.exists() {
+                return Ok(false);
+            }
+            if item.path.is_dir() {
+                Self::trash_dir_contents(&item.path)?;
+                return Ok(true);
+            }
+
+            trash::delete(&item.path).map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+    }
+
+    fn process_items<F>(items: &[CleanableEntry], mut action: F) -> CleanResult
+    where
+        F: FnMut(&CleanableEntry) -> Result<bool, String>,
+    {
         let mut freed_space = 0u64;
         let mut errors = Vec::new();
 
         for item in items {
-            match Self::remove_path(&item.path) {
-                Ok(()) => {
-                    freed_space += item.size.unwrap_or(0);
+            match action(item) {
+                Ok(should_add_freed_space) => {
+                    if should_add_freed_space {
+                        freed_space += item.size.unwrap_or(0);
+                    }
                 }
-                Err(e) => {
-                    errors.push(format!("{}: {}", item.path.display(), e));
+                Err(error_message) => {
+                    errors.push(Self::format_item_error(&item.path, &error_message))
                 }
             }
         }
@@ -58,42 +100,8 @@ impl Cleaner {
         }
     }
 
-    /// 将选中的项目移至系统回收站
-    pub fn trash_items(items: &[CleanableEntry]) -> CleanResult {
-        let mut freed_space = 0u64;
-        let mut errors = Vec::new();
-
-        for item in items {
-            if !item.path.exists() {
-                continue;
-            }
-            if item.path.is_dir() {
-                // 对目录：移动目录内容至回收站，保留目录本身
-                match Self::trash_dir_contents(&item.path) {
-                    Ok(()) => {
-                        freed_space += item.size.unwrap_or(0);
-                    }
-                    Err(e) => {
-                        errors.push(format!("{}: {}", item.path.display(), e));
-                    }
-                }
-            } else {
-                match trash::delete(&item.path) {
-                    Ok(()) => {
-                        freed_space += item.size.unwrap_or(0);
-                    }
-                    Err(e) => {
-                        errors.push(format!("{}: {}", item.path.display(), e));
-                    }
-                }
-            }
-        }
-
-        CleanResult {
-            success: errors.is_empty(),
-            freed_space,
-            errors,
-        }
+    fn format_item_error(path: &Path, error_message: &str) -> String {
+        format!("{}: {}", path.display(), error_message)
     }
 
     /// 将目录内容移至回收站，保留目录结构本身
@@ -245,25 +253,10 @@ impl Cleaner {
             Err(_) => return false,
         };
 
-        // 不允许删除的路径
-        const FORBIDDEN: &[&str] = &[
-            "/",
-            "/System",
-            "/Library",
-            "/Applications",
-            "/Users",
-            "/bin",
-            "/sbin",
-            "/usr",
-            "/var",
-            "/etc",
-            "/private",
-        ];
-
         let path_str = canonical.to_string_lossy();
 
         // 检查是否为禁止路径
-        for f in FORBIDDEN {
+        for f in FORBIDDEN_PATHS {
             if path_str == *f {
                 return false;
             }
@@ -319,21 +312,7 @@ mod tests {
 
     #[test]
     fn is_safe_to_delete_rejects_forbidden_paths() {
-        let forbidden = [
-            "/",
-            "/System",
-            "/Library",
-            "/Applications",
-            "/Users",
-            "/bin",
-            "/sbin",
-            "/usr",
-            "/var",
-            "/etc",
-            "/private",
-        ];
-
-        for path in forbidden {
+        for path in FORBIDDEN_PATHS {
             assert!(!Cleaner::is_safe_to_delete(Path::new(path)));
         }
     }

@@ -8,12 +8,19 @@ use clap::Parser;
 use color_eyre::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use vac::app::{App, EntryKind, Mode};
+use vac::app::{App, CleanableEntry, EntryKind, Mode, SortOrder, sort_entries_by};
 use vac::cleaner::Cleaner;
 use vac::cli::Cli;
 use vac::config::AppConfig;
 use vac::scanner::{ScanKind, ScanMessage, Scanner, format_size, scanner_from_config};
 use vac::ui;
+use vac::utils::format_time;
+
+const POLL_INTERVAL_SCANNING_MS: u64 = 16;
+const POLL_INTERVAL_IDLE_MS: u64 = 100;
+const SCAN_JOB_ID_BLOCKING: u64 = 1;
+const SCAN_INIT_ERROR_MESSAGE: &str = "无法初始化扫描器";
+const REPORT_SEPARATOR_WIDTH: usize = 70;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -81,9 +88,9 @@ fn run_tui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         }
 
         let poll_timeout = if scan_rx.is_some() {
-            Duration::from_millis(16)
+            Duration::from_millis(POLL_INTERVAL_SCANNING_MS)
         } else {
-            Duration::from_millis(100)
+            Duration::from_millis(POLL_INTERVAL_IDLE_MS)
         };
         if event::poll(poll_timeout)?
             && let Event::Key(key) = event::read()?
@@ -275,6 +282,27 @@ fn cancel_scan(
     *scan_rx = None;
 }
 
+fn send_scan_init_error(job_id: u64, tx: &mpsc::Sender<ScanMessage>) {
+    let _ = tx.send(ScanMessage::Error {
+        job_id,
+        message: SCAN_INIT_ERROR_MESSAGE.to_string(),
+    });
+}
+
+fn spawn_scan_thread<F>(
+    cancel_generation: &Arc<AtomicU64>,
+    job_id: u64,
+    run_scan: F,
+) -> Receiver<ScanMessage>
+where
+    F: FnOnce(u64, mpsc::Sender<ScanMessage>, Arc<AtomicU64>) + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let cancel_generation_clone = Arc::clone(cancel_generation);
+    thread::spawn(move || run_scan(job_id, tx, cancel_generation_clone));
+    rx
+}
+
 fn handle_confirm_mode(
     app: &mut App,
     key: KeyCode,
@@ -328,20 +356,18 @@ fn start_root_scan(
     app.clear_entries();
     app.clear_root_entries();
 
-    let (tx, rx) = mpsc::channel();
-    let cancel_clone = cancel_generation.clone();
     let extra_targets = config.expanded_extra_targets();
-
-    thread::spawn(move || {
-        if let Some(scanner) = Scanner::with_extra_targets(extra_targets) {
-            scanner.scan_root_with_progress(job_id, tx, cancel_clone);
-        } else {
-            let _ = tx.send(ScanMessage::Error {
-                job_id,
-                message: "无法初始化扫描器".to_string(),
-            });
-        }
-    });
+    let rx = spawn_scan_thread(
+        cancel_generation,
+        job_id,
+        move |scan_job_id, tx, cancel_clone| {
+            if let Some(scanner) = Scanner::with_extra_targets(extra_targets) {
+                scanner.scan_root_with_progress(scan_job_id, tx, cancel_clone);
+            } else {
+                send_scan_init_error(scan_job_id, &tx);
+            }
+        },
+    );
 
     Some(rx)
 }
@@ -359,19 +385,17 @@ fn start_dir_scan(
     app.current_scan_path = path.display().to_string();
     app.clear_entries();
 
-    let (tx, rx) = mpsc::channel();
-    let cancel_clone = cancel_generation.clone();
-
-    thread::spawn(move || {
-        if let Some(scanner) = Scanner::new() {
-            scanner.scan_dir_listing(job_id, path, tx, cancel_clone);
-        } else {
-            let _ = tx.send(ScanMessage::Error {
-                job_id,
-                message: "无法初始化扫描器".to_string(),
-            });
-        }
-    });
+    let rx = spawn_scan_thread(
+        cancel_generation,
+        job_id,
+        move |scan_job_id, tx, cancel_clone| {
+            if let Some(scanner) = Scanner::new() {
+                scanner.scan_dir_listing(scan_job_id, path, tx, cancel_clone);
+            } else {
+                send_scan_init_error(scan_job_id, &tx);
+            }
+        },
+    );
 
     Some(rx)
 }
@@ -391,19 +415,17 @@ fn start_disk_scan(
     app.clear_entries();
     app.clear_root_entries();
 
-    let (tx, rx) = mpsc::channel();
-    let cancel_clone = cancel_generation.clone();
-
-    thread::spawn(move || {
-        if let Some(scanner) = Scanner::new() {
-            scanner.scan_disk_with_progress(job_id, path, tx, cancel_clone);
-        } else {
-            let _ = tx.send(ScanMessage::Error {
-                job_id,
-                message: "无法初始化扫描器".to_string(),
-            });
-        }
-    });
+    let rx = spawn_scan_thread(
+        cancel_generation,
+        job_id,
+        move |scan_job_id, tx, cancel_clone| {
+            if let Some(scanner) = Scanner::new() {
+                scanner.scan_disk_with_progress(scan_job_id, path, tx, cancel_clone);
+            } else {
+                send_scan_init_error(scan_job_id, &tx);
+            }
+        },
+    );
 
     Some(rx)
 }
@@ -451,8 +473,6 @@ fn execute_clean(
 }
 
 // ── 非交互模式 ──────────────────────────────────────────────
-
-use vac::app::{CleanableEntry, SortOrder};
 use vac::cli::ScanTarget;
 
 /// 非交互模式的扫描结果条目（用于 JSON 输出）
@@ -514,55 +534,45 @@ struct DryRunReport {
 
 /// 同步执行扫描并收集结果
 fn run_scan_blocking(scan_target: &ScanTarget, config: &AppConfig) -> Result<Vec<CleanableEntry>> {
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicU64::new(0));
-    let job_id = 1u64;
-    cancel.store(job_id, Ordering::SeqCst);
+    let cancel_generation = Arc::new(AtomicU64::new(0));
+    let job_id = SCAN_JOB_ID_BLOCKING;
+    cancel_generation.store(job_id, Ordering::SeqCst);
 
-    match scan_target {
-        ScanTarget::Preset => {
-            let extra_targets = config.expanded_extra_targets();
-            let cancel_clone = cancel.clone();
-            thread::spawn(move || {
+    let requested_target = scan_target.clone();
+    let extra_targets = config.expanded_extra_targets();
+    let rx = spawn_scan_thread(
+        &cancel_generation,
+        job_id,
+        move |scan_job_id, tx, cancel_generation_clone| match requested_target {
+            ScanTarget::Preset => {
                 if let Some(scanner) = Scanner::with_extra_targets(extra_targets) {
-                    scanner.scan_root_with_progress(job_id, tx, cancel_clone);
+                    scanner.scan_root_with_progress(scan_job_id, tx, cancel_generation_clone);
                 } else {
-                    let _ = tx.send(ScanMessage::Error {
-                        job_id,
-                        message: "无法初始化扫描器".to_string(),
-                    });
+                    send_scan_init_error(scan_job_id, &tx);
                 }
-            });
-        }
-        ScanTarget::Home => {
-            let cancel_clone = cancel.clone();
-            thread::spawn(move || {
+            }
+            ScanTarget::Home => {
                 if let Some(scanner) = Scanner::new() {
-                    let home = scanner.home_dir().clone();
-                    scanner.scan_disk_with_progress(job_id, home, tx, cancel_clone);
+                    let home_path = scanner.home_dir().clone();
+                    scanner.scan_disk_with_progress(
+                        scan_job_id,
+                        home_path,
+                        tx,
+                        cancel_generation_clone,
+                    );
                 } else {
-                    let _ = tx.send(ScanMessage::Error {
-                        job_id,
-                        message: "无法初始化扫描器".to_string(),
-                    });
+                    send_scan_init_error(scan_job_id, &tx);
                 }
-            });
-        }
-        ScanTarget::Path(path) => {
-            let path = path.clone();
-            let cancel_clone = cancel.clone();
-            thread::spawn(move || {
+            }
+            ScanTarget::Path(path) => {
                 if let Some(scanner) = Scanner::new() {
-                    scanner.scan_disk_with_progress(job_id, path, tx, cancel_clone);
+                    scanner.scan_disk_with_progress(scan_job_id, path, tx, cancel_generation_clone);
                 } else {
-                    let _ = tx.send(ScanMessage::Error {
-                        job_id,
-                        message: "无法初始化扫描器".to_string(),
-                    });
+                    send_scan_init_error(scan_job_id, &tx);
                 }
-            });
-        }
-    }
+            }
+        },
+    );
 
     let mut entries = Vec::new();
     for msg in rx {
@@ -594,94 +604,6 @@ fn run_scan_blocking(scan_target: &ScanTarget, config: &AppConfig) -> Result<Vec
     Ok(entries)
 }
 
-/// 对条目排序
-fn sort_entries(entries: &mut [CleanableEntry], sort_order: &SortOrder) {
-    match sort_order {
-        SortOrder::ByName => {
-            entries.sort_by(|a, b| {
-                use vac::app::EntryKind;
-                match (a.kind, b.kind) {
-                    (EntryKind::Directory, EntryKind::File) => std::cmp::Ordering::Less,
-                    (EntryKind::File, EntryKind::Directory) => std::cmp::Ordering::Greater,
-                    _ => a.name.cmp(&b.name),
-                }
-            });
-        }
-        SortOrder::BySize => {
-            entries.sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
-        }
-        SortOrder::ByTime => {
-            entries.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-        }
-    }
-}
-
-/// 格式化 SystemTime 为 "YYYY-MM-DD HH:MM:SS" 字符串（CLI 输出用）
-fn format_time_cli(time: &std::time::SystemTime) -> String {
-    let duration = time
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs() as i64;
-
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    let mut remaining_days = days;
-    let mut year = 1970i32;
-
-    loop {
-        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            366
-        } else {
-            365
-        };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_months: [i64; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-
-    let mut month = 0usize;
-    for (i, &dim) in days_in_months.iter().enumerate() {
-        if remaining_days < dim {
-            month = i;
-            break;
-        }
-        remaining_days -= dim;
-    }
-
-    let day = remaining_days + 1;
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year,
-        month + 1,
-        day,
-        hours,
-        minutes,
-        seconds
-    )
-}
-
 /// 非交互模式入口
 fn run_non_interactive(cli: Cli) -> Result<()> {
     let config = AppConfig::load();
@@ -703,7 +625,7 @@ fn run_non_interactive(cli: Cli) -> Result<()> {
     eprintln!("扫描目标: {}", scan_target_name);
 
     let mut entries = run_scan_blocking(scan_target, &config)?;
-    sort_entries(&mut entries, &sort_order);
+    sort_entries_by(&mut entries, sort_order);
 
     let total_size: u64 = entries.iter().filter_map(|e| e.size).sum();
 
@@ -722,7 +644,7 @@ fn run_non_interactive(cli: Cli) -> Result<()> {
                 .size
                 .map(format_size)
                 .unwrap_or_else(|| "未知".to_string()),
-            modified_at: e.modified_at.as_ref().map(format_time_cli),
+            modified_at: e.modified_at.as_ref().map(|time| format_time(time, true)),
         })
         .collect();
 
@@ -813,7 +735,7 @@ fn print_report_to_terminal(report: &ScanReport, entries: &[CleanableEntry], use
         "扫描结果: {} 个项目 | 总大小: {}",
         report.total_items, report.total_size_display
     );
-    println!("{}", "─".repeat(70));
+    println!("{}", "─".repeat(REPORT_SEPARATOR_WIDTH));
 
     for entry in entries {
         let kind_icon = match entry.kind {
@@ -827,7 +749,7 @@ fn print_report_to_terminal(report: &ScanReport, entries: &[CleanableEntry], use
         let time_str = entry
             .modified_at
             .as_ref()
-            .map(|t| format!("  {}", format_time_cli(t)))
+            .map(|time| format!("  {}", format_time(time, true)))
             .unwrap_or_default();
 
         println!(
@@ -835,7 +757,7 @@ fn print_report_to_terminal(report: &ScanReport, entries: &[CleanableEntry], use
             kind_icon, size_str, entry.name, time_str
         );
     }
-    println!("{}", "─".repeat(70));
+    println!("{}", "─".repeat(REPORT_SEPARATOR_WIDTH));
 
     // Dry-run 结果
     if let Some(ref dry_run) = report.dry_run {
