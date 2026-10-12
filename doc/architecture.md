@@ -60,6 +60,7 @@ vac/
 跨模块复用的公共函数与常量：
 
 - `expand_tilde(path)`: 统一将 `~` 展开为主目录绝对路径
+- `homebrew_staging_dirs()`: 返回本机存在的 Homebrew 暂存目录（已规范化），扫描目标与删除白名单共用这一份定义
 - `format_time(time, include_time)`: 统一时间格式化
   - `include_time = false` 输出 `YYYY-MM-DD`
   - `include_time = true` 输出 `YYYY-MM-DD HH:MM:SS`
@@ -75,7 +76,7 @@ vac/
 - `Mode`: 应用运行模式 (Normal, Scanning, Confirm, Help, InputPath, Search, Stats)
 - `SortOrder`: 排序方式 (ByName, BySize, ByTime)
 - `EntryKind`: 条目类型（目录/文件）
-- `ItemCategory`: 扫描项分类（系统缓存、日志、临时文件、下载、垃圾桶、Xcode、Homebrew、CocoaPods、npm、pip、Docker、Cargo、自定义目标等）
+- `ItemCategory`: 扫描项分类（系统缓存、日志、临时文件、下载、垃圾桶、Xcode、Homebrew 缓存、Homebrew 暂存、CocoaPods、npm、pip、Docker、Cargo、自定义目标等）
 - `CleanableEntry`: 当前视图条目（含 `modified_at` 时间字段）
 - `SelectedEntry`: 已选条目元数据
 - `NavigationState`: 导航状态（当前路径、带缓存的导航栈）
@@ -192,7 +193,8 @@ vac/
 
 - 使用 `Path::canonicalize()` 解析符号链接后做路径安全检查
 - 禁止删除系统关键目录和用户根目录本身
-- 仅允许用户目录子路径和临时目录
+- 仅允许用户目录子路径和临时目录，以及 Homebrew 暂存目录及其子项（`is_safe_to_delete_with` 接受白名单根目录，便于测试注入）
+- `process_items_with()` 在暂存目录项目上检测 brew 进程，运行中则跳过并记错误；`pgrep` 失败按运行中处理
 - 保留目录结构，仅清理内容
 - 错误收集和报告
 

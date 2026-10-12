@@ -79,6 +79,8 @@ pub enum ItemCategory {
     NodeModules,
     /// Homebrew 缓存
     HomebrewCache,
+    /// Homebrew 升级中断遗留的暂存目录
+    HomebrewStaging,
     /// 下载文件
     Downloads,
     /// 垃圾桶
@@ -107,6 +109,7 @@ impl ItemCategory {
             ItemCategory::XcodeDerivedData => "Xcode 派生数据",
             ItemCategory::NodeModules => "node_modules",
             ItemCategory::HomebrewCache => "Homebrew 缓存",
+            ItemCategory::HomebrewStaging => "Homebrew 暂存",
             ItemCategory::CocoaPods => "CocoaPods 缓存",
             ItemCategory::NpmCache => "npm 缓存",
             ItemCategory::PipCache => "pip 缓存",
@@ -127,6 +130,7 @@ impl ItemCategory {
             ItemCategory::XcodeDerivedData => "Xcode 构建产物和索引",
             ItemCategory::NodeModules => "Node.js 依赖目录",
             ItemCategory::HomebrewCache => "Homebrew 下载缓存",
+            ItemCategory::HomebrewStaging => "brew 升级中断后遗留的 bottle/cask 解压目录",
             ItemCategory::CocoaPods => "CocoaPods 缓存目录",
             ItemCategory::NpmCache => "npm 包下载缓存",
             ItemCategory::PipCache => "pip 包下载缓存",

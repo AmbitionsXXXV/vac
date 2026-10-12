@@ -74,13 +74,14 @@ VAC 会扫描以下 macOS 常见可清理目录：
 3. **临时文件** - `/tmp` 和 `/var/tmp`
 4. **Xcode 派生数据** - `~/Library/Developer/Xcode/DerivedData`
 5. **Homebrew 缓存** - `~/Library/Caches/Homebrew`
-6. **CocoaPods 缓存** - `~/Library/Caches/CocoaPods`
-7. **npm 缓存** - `~/.npm/_cacache`
-8. **pip 缓存** - `~/Library/Caches/pip`
-9. **Docker 数据** - `~/Library/Containers/com.docker.docker/Data`
-10. **Cargo 缓存** - `~/.cargo/registry/cache`
-11. **下载文件夹** - `~/Downloads`
-12. **垃圾桶** - `~/.Trash`
+6. **Homebrew 暂存** - `/opt/homebrew` 与 `/usr/local` 下的 `var/homebrew/tmp/.cellar`、`var/homebrew/tmp/.caskroom`
+7. **CocoaPods 缓存** - `~/Library/Caches/CocoaPods`
+8. **npm 缓存** - `~/.npm/_cacache`
+9. **pip 缓存** - `~/Library/Caches/pip`
+10. **Docker 数据** - `~/Library/Containers/com.docker.docker/Data`
+11. **Cargo 缓存** - `~/.cargo/registry/cache`
+12. **下载文件夹** - `~/Downloads`
+13. **垃圾桶** - `~/.Trash`
 
 以上目录仅在存在时才会被扫描。如果在配置文件中定义了额外扫描目标，也会一并扫描。
 
@@ -269,9 +270,19 @@ vac --help
 - 禁止删除系统关键目录（`/`, `/System`, `/Library` 等）
 - 禁止删除用户根目录本身
 - 仅允许删除用户目录下的子目录/文件和临时目录下的内容
+- 唯一的例外是 Homebrew 暂存目录（`<前缀>/var/homebrew/tmp/.cellar` 和 `.caskroom`）及其子项，见下文
 - 目录遍历不跟随符号链接（`follow_links(false)`）
 - 删除前需要二次确认，可预览待删项
 - 清理目录内容时保留目录本身
+
+### Homebrew 暂存目录
+
+brew 安装或升级时先把 bottle/cask 解压到暂存目录，再移入 `Cellar`。升级被中断后，这些解压内容会一直留下，实测可累积到数 GB（llvm、gcc 等大包各占 1 GB 以上）。`brew cleanup` 的 `cleanup_temp_staging` 也是直接逐项删除这两个目录的子项，VAC 与它的行为一致：
+
+- 只放行这两个目录本身及其内部路径；同一前缀下的 `Cellar`、`bin`、前缀根目录等仍被拒绝
+- 符号链接按真实目标判断，指向暂存目录外的链接会被拒绝
+- 清理时如果检测到 brew 进程（`pgrep -f 'Library/Homebrew/brew\.(rb|sh)'`）正在运行，跳过暂存目录中的项目并报错，避免删掉正在解压的文件；`pgrep` 无法执行时同样跳过
+- 不升级任何包，不替代 `brew cleanup` 对旧版本和下载缓存的清理
 
 ## 注意事项
 

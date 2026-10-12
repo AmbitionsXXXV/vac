@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub const SECONDS_PER_DAY: i64 = 86_400;
@@ -11,6 +12,29 @@ fn is_leap_year(year: i32) -> bool {
 
 fn days_in_year(year: i32) -> i64 {
     if is_leap_year(year) { 366 } else { 365 }
+}
+
+/// Apple Silicon 与 Intel 两种 Homebrew 安装前缀。
+const HOMEBREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local"];
+
+/// Homebrew 下载队列解压 bottle/cask 的暂存目录（`HOMEBREW_TEMP_CELLAR` /
+/// `HOMEBREW_TEMP_CASKROOM`）。升级中断后内容会一直留下；`brew cleanup` 的
+/// `cleanup_temp_staging` 也是直接逐项删除这两个目录的子项。
+const HOMEBREW_STAGING_SUBDIRS: &[&str] =
+    &["var/homebrew/tmp/.cellar", "var/homebrew/tmp/.caskroom"];
+
+/// 返回本机存在的 Homebrew 暂存目录（已规范化，可直接用于路径前缀比较）。
+pub fn homebrew_staging_dirs() -> Vec<PathBuf> {
+    HOMEBREW_PREFIXES
+        .iter()
+        .flat_map(|prefix| {
+            HOMEBREW_STAGING_SUBDIRS
+                .iter()
+                .map(move |subdir| Path::new(prefix).join(subdir))
+        })
+        .filter_map(|dir| dir.canonicalize().ok())
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 /// 将路径中的 `~` 展开为主目录绝对路径。

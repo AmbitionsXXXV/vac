@@ -1,9 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use walkdir::WalkDir;
 
 use crate::app::CleanableEntry;
+use crate::utils::homebrew_staging_dirs;
 
 /// 清理结果
 #[derive(Debug)]
@@ -48,6 +50,27 @@ const FORBIDDEN_PATHS: &[&str] = &[
     "/private",
 ];
 
+/// 匹配正在运行的 brew（`.../Library/Homebrew/brew.rb` 或 `brew.sh`）。
+const HOMEBREW_PROCESS_PATTERN: &str = "Library/Homebrew/brew\\.(rb|sh)";
+
+/// 此时 brew 可能正在向暂存目录解压，删除会破坏安装。
+const HOMEBREW_RUNNING_ERROR: &str = "Homebrew 正在运行，跳过暂存目录";
+
+fn is_inside_any(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+/// 检测 brew 进程；pgrep 无法执行时按"正在运行"处理，宁可跳过也不误删。
+fn homebrew_running() -> bool {
+    Command::new("/usr/bin/pgrep")
+        .args(["-f", HOMEBREW_PROCESS_PATTERN])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
 impl Cleaner {
     /// 清理选中的项目（永久删除）
     pub fn clean(items: &[CleanableEntry]) -> CleanResult {
@@ -73,14 +96,36 @@ impl Cleaner {
         })
     }
 
-    fn process_items<F>(items: &[CleanableEntry], mut action: F) -> CleanResult
+    fn process_items<F>(items: &[CleanableEntry], action: F) -> CleanResult
+    where
+        F: FnMut(&CleanableEntry) -> Result<bool, String>,
+    {
+        Self::process_items_with(items, &homebrew_staging_dirs(), homebrew_running, action)
+    }
+
+    fn process_items_with<F>(
+        items: &[CleanableEntry],
+        staging_roots: &[PathBuf],
+        brew_running: impl Fn() -> bool,
+        mut action: F,
+    ) -> CleanResult
     where
         F: FnMut(&CleanableEntry) -> Result<bool, String>,
     {
         let mut freed_space = 0u64;
         let mut errors = Vec::new();
+        let mut brew_busy = None;
 
         for item in items {
+            let in_staging = item
+                .path
+                .canonicalize()
+                .is_ok_and(|path| is_inside_any(&path, staging_roots));
+            if in_staging && *brew_busy.get_or_insert_with(&brew_running) {
+                errors.push(Self::format_item_error(&item.path, HOMEBREW_RUNNING_ERROR));
+                continue;
+            }
+
             match action(item) {
                 Ok(should_add_freed_space) => {
                     if should_add_freed_space {
@@ -246,7 +291,12 @@ impl Cleaner {
     ///
     /// 使用 canonicalize 解析符号链接，防止通过符号链接绕过安全检查。
     /// 禁止删除系统关键目录和用户根目录本身。
+    /// 用户目录、临时目录之外，只放行 Homebrew 暂存目录及其子项。
     pub fn is_safe_to_delete(path: &Path) -> bool {
+        Self::is_safe_to_delete_with(path, &homebrew_staging_dirs())
+    }
+
+    fn is_safe_to_delete_with(path: &Path, staging_roots: &[PathBuf]) -> bool {
         // 规范化路径，解析符号链接
         let canonical = match path.canonicalize() {
             Ok(p) => p,
@@ -260,6 +310,10 @@ impl Cleaner {
             if path_str == *f {
                 return false;
             }
+        }
+
+        if is_inside_any(&canonical, staging_roots) {
+            return true;
         }
 
         // 确保路径在用户目录下或临时目录下
@@ -338,6 +392,107 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("create temp dir");
         assert!(Cleaner::is_safe_to_delete(dir.path()));
+    }
+
+    /// 模拟 Homebrew 前缀：放在默认 TMPDIR（/private/var/folders/...），
+    /// 它既不在用户目录也不在 /tmp，现有规则本身会拒绝，只有暂存白名单能放行。
+    fn fake_homebrew_prefix() -> (tempfile::TempDir, PathBuf) {
+        let prefix = tempfile::tempdir().expect("create fake prefix");
+        let staging = prefix.path().join("var/homebrew/tmp/.cellar");
+        fs::create_dir_all(staging.join("python@3.13/3.13.13_1")).expect("create staging keg");
+        fs::create_dir_all(prefix.path().join("Cellar/python@3.13")).expect("create cellar");
+        fs::create_dir_all(prefix.path().join("var/homebrew/tmp/.cellar-other"))
+            .expect("create sibling");
+        let staging = staging.canonicalize().expect("canonical staging");
+        (prefix, staging)
+    }
+
+    #[test]
+    fn is_safe_to_delete_accepts_homebrew_staging_and_its_children() {
+        let (_prefix, staging) = fake_homebrew_prefix();
+        let roots = vec![staging.clone()];
+
+        assert!(Cleaner::is_safe_to_delete_with(&staging, &roots));
+        assert!(Cleaner::is_safe_to_delete_with(
+            &staging.join("python@3.13/3.13.13_1"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn is_safe_to_delete_rejects_rest_of_homebrew_prefix() {
+        let (prefix, staging) = fake_homebrew_prefix();
+        let roots = vec![staging];
+
+        assert!(!Cleaner::is_safe_to_delete_with(prefix.path(), &roots));
+        assert!(!Cleaner::is_safe_to_delete_with(
+            &prefix.path().join("Cellar/python@3.13"),
+            &roots
+        ));
+        assert!(!Cleaner::is_safe_to_delete_with(
+            &prefix.path().join("var/homebrew/tmp/.cellar-other"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn is_safe_to_delete_rejects_symlink_escaping_homebrew_staging() {
+        let (prefix, staging) = fake_homebrew_prefix();
+        let link = staging.join("escape");
+        std::os::unix::fs::symlink(prefix.path().join("Cellar"), &link).expect("create symlink");
+
+        assert!(!Cleaner::is_safe_to_delete_with(&link, &[staging]));
+    }
+
+    #[test]
+    fn clean_skips_homebrew_staging_while_brew_is_running() {
+        let (_prefix, staging) = fake_homebrew_prefix();
+        let keg = staging.join("python@3.13");
+        let other_dir = tempfile::Builder::new()
+            .prefix("vac-brew-guard-")
+            .tempdir_in("/tmp")
+            .expect("create temp dir");
+        let other_file = other_dir.path().join("other.txt");
+        fs::write(&other_file, b"other").expect("write other file");
+
+        let result = Cleaner::process_items_with(
+            &[
+                item(keg.clone(), Some(7)),
+                item(other_file.clone(), Some(5)),
+            ],
+            std::slice::from_ref(&staging),
+            || true,
+            |item| {
+                Cleaner::remove_path(&item.path).map_err(|error| error.to_string())?;
+                Ok(true)
+            },
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Homebrew"));
+        assert!(keg.join("3.13.13_1").exists());
+        assert!(!other_file.exists());
+        assert_eq!(result.freed_space, 5);
+    }
+
+    #[test]
+    fn clean_removes_homebrew_staging_contents_when_brew_is_idle() {
+        let (_prefix, staging) = fake_homebrew_prefix();
+
+        let result = Cleaner::process_items_with(
+            &[item(staging.clone(), Some(7))],
+            std::slice::from_ref(&staging),
+            || false,
+            |item| {
+                Cleaner::remove_path(&item.path).map_err(|error| error.to_string())?;
+                Ok(true)
+            },
+        );
+
+        assert!(result.success);
+        assert!(staging.exists());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 
     #[test]

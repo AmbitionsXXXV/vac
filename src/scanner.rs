@@ -7,6 +7,7 @@ use std::sync::mpsc::Sender;
 use walkdir::WalkDir;
 
 use crate::app::{CleanableEntry, EntryKind, ItemCategory};
+use crate::utils::homebrew_staging_dirs;
 
 const ROOT_PROGRESS_COMPLETE: f32 = 100.0;
 const DISK_PROGRESS_HALF: f32 = 50.0;
@@ -130,6 +131,11 @@ impl Scanner {
             ItemCategory::HomebrewCache,
             self.home_dir.join("Library/Caches/Homebrew"),
         );
+
+        // Homebrew 暂存目录（升级中断遗留，含 Intel 前缀）
+        for staging_dir in homebrew_staging_dirs() {
+            targets.push((ItemCategory::HomebrewStaging, staging_dir));
+        }
 
         // CocoaPods 缓存
         add_target_if_exists(
