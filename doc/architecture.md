@@ -11,7 +11,8 @@ vac/
 ├── Cargo.toml          # 项目配置和依赖
 ├── doc/                # 文档目录
 │   ├── architecture.md # 架构文档
-│   └── usage.md        # 使用说明
+│   ├── usage.md        # 使用说明
+│   └── cleaning-rules.md # 清理规则总览（对照 Mole）
 └── src/
     ├── main.rs         # 程序入口、事件循环、键盘处理、CLI 非交互模式
     ├── lib.rs          # 库入口，模块导出
