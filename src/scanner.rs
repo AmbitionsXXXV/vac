@@ -125,11 +125,12 @@ impl Scanner {
             self.home_dir.join("Library/Developer/Xcode/DerivedData"),
         );
 
-        // Homebrew 缓存（条件添加）
+        // Homebrew 下载缓存（条件添加）。只清 downloads/：api/ 需联网重新下载，
+        // bootsnap/ 需重新编译，删掉后下次 brew 命令会长时间无输出
         add_target_if_exists(
             &mut targets,
             ItemCategory::HomebrewCache,
-            self.home_dir.join("Library/Caches/Homebrew"),
+            self.home_dir.join("Library/Caches/Homebrew/downloads"),
         );
 
         // Homebrew 暂存目录（升级中断遗留，含 Intel 前缀）
@@ -525,6 +526,29 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{Arc, atomic::AtomicU64};
+
+    #[test]
+    fn homebrew_cache_target_is_downloads_only() {
+        // api/ 和 bootsnap/ 删除后 brew 需联网重建，下次命令会长时间无输出
+        let home = tempfile::tempdir().expect("create fake home");
+        let cache = home.path().join("Library/Caches/Homebrew");
+        for subdir in ["downloads", "api", "bootsnap"] {
+            fs::create_dir_all(cache.join(subdir)).expect("create brew cache subdir");
+        }
+        let scanner = Scanner {
+            home_dir: home.path().to_path_buf(),
+            extra_targets: Vec::new(),
+        };
+
+        let brew_targets: Vec<PathBuf> = scanner
+            .get_scan_targets()
+            .into_iter()
+            .filter(|(category, _)| *category == ItemCategory::HomebrewCache)
+            .map(|(_, path)| path)
+            .collect();
+
+        assert_eq!(brew_targets, vec![cache.join("downloads")]);
+    }
 
     #[test]
     fn scan_directory_returns_zero_for_missing_path() {

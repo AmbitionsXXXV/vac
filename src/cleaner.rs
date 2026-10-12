@@ -328,10 +328,11 @@ impl Cleaner {
             }
         }
 
-        // 允许临时目录（含 macOS /private/tmp 实际路径）
+        // 允许临时目录（含 macOS /private/tmp、/private/var/tmp 实际路径）
         if canonical.starts_with("/tmp")
             || canonical.starts_with("/private/tmp")
             || canonical.starts_with("/var/tmp")
+            || canonical.starts_with("/private/var/tmp")
         {
             return true;
         }
@@ -390,6 +391,16 @@ mod tests {
         let dir = tempfile::Builder::new()
             .prefix("vac-test-")
             .tempdir_in("/tmp")
+            .expect("create temp dir");
+        assert!(Cleaner::is_safe_to_delete(dir.path()));
+    }
+
+    #[test]
+    fn is_safe_to_delete_accepts_var_tmp_paths() {
+        // macOS 上 /var 是指向 /private/var 的符号链接，规范化后不再以 /var/tmp 开头
+        let dir = tempfile::Builder::new()
+            .prefix("vac-test-")
+            .tempdir_in("/var/tmp")
             .expect("create temp dir");
         assert!(Cleaner::is_safe_to_delete(dir.path()));
     }

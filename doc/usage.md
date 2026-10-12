@@ -73,7 +73,7 @@ VAC 会扫描以下 macOS 常见可清理目录：
 2. **日志文件** - `~/Library/Logs`
 3. **临时文件** - `/tmp` 和 `/var/tmp`
 4. **Xcode 派生数据** - `~/Library/Developer/Xcode/DerivedData`
-5. **Homebrew 缓存** - `~/Library/Caches/Homebrew`
+5. **Homebrew 缓存** - `~/Library/Caches/Homebrew/downloads`（不清 `api/`、`bootsnap/`，它们删除后 brew 需联网重建）
 6. **Homebrew 暂存** - `/opt/homebrew` 与 `/usr/local` 下的 `var/homebrew/tmp/.cellar`、`var/homebrew/tmp/.caskroom`
 7. **CocoaPods 缓存** - `~/Library/Caches/CocoaPods`
 8. **npm 缓存** - `~/.npm/_cacache`
